@@ -103,12 +103,14 @@ enum class MiniMaxH3ReferenceKind : int32_t {
     VIDEO,
     AUDIO,
     VIDEO_AUDIO,
+    GUIDE,  // keyframe guide anchored at frame_index on the target timeline
 };
 
 struct MiniMaxH3ReferenceBlock {
     MiniMaxH3ReferenceKind kind = MiniMaxH3ReferenceKind::IMAGE;
     int32_t video_index         = -1;
     int32_t audio_index         = -1;
+    int32_t frame_index         = -1;
 };
 
 struct MiniMaxH3DiffusionExtra {
@@ -119,6 +121,7 @@ struct MiniMaxH3DiffusionExtra {
     int audio_length                                              = 0;
     float video_sigma_shift                                       = 12.f;
     float audio_sigma_shift                                       = 3.f;
+    const std::vector<float>* visual_cond_noise_augs              = nullptr;
 };
 
 struct MiniT2IDiffusionExtra {

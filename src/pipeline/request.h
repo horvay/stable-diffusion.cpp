@@ -50,6 +50,8 @@ namespace sd::pipeline {
         int requested_frames                     = -1;
         int fps                                  = 16;
         float vace_strength                      = 1.f;
+        float init_image_strength                = 1.f;
+        float end_image_strength                 = 1.f;
 
         GenerationRequest(StableDiffusionGGML* sd, const sd_img_gen_params_t* sd_img_gen_params);
 

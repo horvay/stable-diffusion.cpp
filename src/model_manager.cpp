@@ -1602,6 +1602,13 @@ void ModelManager::release_compute_backend_params(const std::vector<ggml_tensor*
     finish_compute_backend_usage(required_states);
 }
 
+void ModelManager::release_idle_device_memory() {
+    for (const auto& entry : workspace_reclaimers_) {
+        entry.second();
+    }
+    release_compute_staging_blocks(false);
+}
+
 void ModelManager::evict_compute_backend_params(const std::vector<ggml_tensor*>& tensors) {
     if (tensors.empty()) {
         return;

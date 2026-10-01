@@ -1,3 +1,4 @@
+#include <dlfcn.h>
 #include "generation.h"
 
 #include <algorithm>
@@ -509,18 +510,22 @@ namespace sd::pipeline {
                 return std::nullopt;
             }
 
-            auto add_visual_noise = [&](sd::Tensor<float> latent) {
+            auto add_visual_noise = [&](sd::Tensor<float> latent, float strength = 1.f) {
+                float aug = std::clamp(strength, 0.f, 1.f);
+                if (aug >= 1.f) {
+                    aug = MiniMaxH3::VISUAL_COND_TIMESTEP;
+                }
                 auto condition_rng = std::make_shared<PhiloxRNG>();
                 condition_rng->manual_seed(static_cast<uint64_t>(request->seed));
-                return latent * MiniMaxH3::VISUAL_COND_TIMESTEP +
-                       sd::Tensor<float>::randn_like(latent, condition_rng) *
-                           (1.f - MiniMaxH3::VISUAL_COND_TIMESTEP);
+                return latent * aug +
+                       sd::Tensor<float>::randn_like(latent, condition_rng) * (1.f - aug);
             };
 
             auto add_keyframe = [&](const sd::Tensor<float>& image,
                                     int32_t frame_index,
-                                    const char* name) -> bool {
-                if (image.empty()) {
+                                    const char* name,
+                                    float strength) -> bool {
+                if (image.empty() || strength <= 0.f) {
                     return true;
                 }
                 auto video_image = image.reshape({image.shape()[0],
@@ -533,11 +538,18 @@ namespace sd::pipeline {
                     LOG_ERROR("failed to encode MiniMax-H3 %s keyframe", name);
                     return false;
                 }
+                float aug = std::clamp(strength, 0.f, 1.f);
+                if (aug >= 1.f) {
+                    aug = MiniMaxH3::VISUAL_COND_TIMESTEP;
+                }
+                LOG_INFO("MiniMax-H3 %s keyframe strength %.3f aug %.3f", name, strength, aug);
                 latents.ref_images.push_back(image);
-                latents.ref_latents.push_back(add_visual_noise(std::move(latent)));
+                latents.ref_latents.push_back(add_visual_noise(std::move(latent), strength));
                 latents.keyframe_indices.push_back(frame_index);
+                latents.visual_cond_augs.push_back(aug);
                 return true;
             };
+
 
             auto resize_reference = [&](const sd::Tensor<float>& image,
                                         int width,
@@ -713,13 +725,83 @@ namespace sd::pipeline {
                 }
             }
 
+            if (sd_vid_gen_params->guides_count > 0) {
+                if (sd_vid_gen_params->guides == nullptr) {
+                    LOG_ERROR("invalid MiniMax-H3 guide array");
+                    return std::nullopt;
+                }
+                if (!start_image.empty() || !end_image.empty()) {
+                    LOG_ERROR("MiniMax-H3 guides replace --init-img/--end-img; anchor them as guides at frame 0 and -1");
+                    return std::nullopt;
+                }
+                for (int i = 0; i < sd_vid_gen_params->guides_count; ++i) {
+                    const auto& guide = sd_vid_gen_params->guides[i];
+                    int frame_idx     = guide.frame_idx >= 0 ? guide.frame_idx : request->frames + guide.frame_idx;
+                    if (frame_idx < 0 || frame_idx >= request->frames) {
+                        LOG_ERROR("MiniMax-H3 guide %d frame_idx %d is outside the video's %d frames",
+                                  i + 1, guide.frame_idx, request->frames);
+                        return std::nullopt;
+                    }
+                    MiniMaxH3ReferenceBlock block{MiniMaxH3ReferenceKind::GUIDE, -1, -1, frame_idx};
+                    if (guide.image.data != nullptr) {
+                        auto image = ensure_image_tensor_channels(
+                            sd_image_to_tensor(guide.image, request->width, request->height),
+                            sd->get_image_channels());
+                        auto video_image = image.reshape({image.shape()[0], image.shape()[1], 1,
+                                                          image.shape()[2], image.shape()[3]});
+                        auto latent      = sd->encode_first_stage(video_image);
+                        if (latent.empty()) {
+                            LOG_ERROR("failed to encode MiniMax-H3 guide %d", i + 1);
+                            return std::nullopt;
+                        }
+                        float strength = guide.strength > 0.f ? guide.strength : 1.f;
+                        float aug      = std::min(strength, 1.f);
+                        if (aug >= 1.f) {
+                            aug = MiniMaxH3::VISUAL_COND_TIMESTEP;
+                        }
+                        latents.visual_cond_augs.resize(latents.ref_latents.size(), MiniMaxH3::VISUAL_COND_TIMESTEP);
+                        block.video_index = static_cast<int32_t>(latents.ref_latents.size());
+                        latents.ref_latents.push_back(add_visual_noise(std::move(latent), strength));
+                        latents.visual_cond_augs.push_back(aug);
+                    }
+                    if (guide.audio.data != nullptr && guide.audio.sample_count > 0) {
+                        int32_t audio_index = -1;
+                        if (!encode_reference_audio(guide.audio, &audio_index)) {
+                            return std::nullopt;
+                        }
+                        auto& encoded  = latents.reference_audio_latents[static_cast<size_t>(audio_index)];
+                        int64_t max_rt = static_cast<int64_t>(std::floor(latents.audio_length -
+                                                                         MiniMaxH3::FRAME_RESCALE * frame_idx));
+                        if (max_rt < 1) {
+                            LOG_ERROR("MiniMax-H3 guide %d frame_idx %d is past the end of the audio track",
+                                      i + 1, frame_idx);
+                            return std::nullopt;
+                        }
+                        if (encoded.shape()[0] > max_rt) {
+                            encoded = sd::ops::slice(encoded, 0, 0, max_rt);
+                        }
+                        block.audio_index = audio_index;
+                    }
+                    if (block.video_index < 0 && block.audio_index < 0) {
+                        LOG_ERROR("MiniMax-H3 guide %d needs an image or audio", i + 1);
+                        return std::nullopt;
+                    }
+                    LOG_INFO("MiniMax-H3 guide %d at frame %d: %s%s (strength %.3f)",
+                             i + 1, frame_idx,
+                             block.video_index >= 0 ? "image" : "",
+                             block.audio_index >= 0 ? (block.video_index >= 0 ? "+audio" : "audio") : "",
+                             guide.strength > 0.f ? guide.strength : 1.f);
+                    latents.minimax_reference_blocks.push_back(block);
+                }
+            }
+
             if (!has_references && (!start_image.empty() || !end_image.empty())) {
                 LOG_INFO(!start_image.empty() && !end_image.empty() ? "MiniMax-H3 FL2VA" : !start_image.empty() ? "MiniMax-H3 I2VA"
                                                                                                                 : "MiniMax-H3 end-frame conditioning");
             }
             if (!has_references &&
-                (!add_keyframe(start_image, 0, "start") ||
-                 !add_keyframe(end_image, request->frames - 1, "end"))) {
+                (!add_keyframe(start_image, 0, "start", request->init_image_strength) ||
+                 !add_keyframe(end_image, request->frames - 1, "end", request->end_image_strength))) {
                 return std::nullopt;
             }
         }
@@ -1173,6 +1255,7 @@ namespace sd::pipeline {
             embeds.cond.c_ref_images       = latents.ref_latents;
             embeds.cond.c_ref_audios       = latents.reference_audio_latents;
             embeds.cond.c_reference_blocks = latents.minimax_reference_blocks;
+            embeds.cond.c_visual_cond_augs = latents.visual_cond_augs;
             if (!latents.keyframe_indices.empty()) {
                 embeds.cond.c_position_ids = sd::Tensor<int32_t>(
                     {static_cast<int64_t>(latents.keyframe_indices.size())},
@@ -1199,6 +1282,7 @@ namespace sd::pipeline {
                 embeds.uncond.c_ref_audios       = latents.reference_audio_latents;
                 embeds.uncond.c_reference_blocks = latents.minimax_reference_blocks;
                 embeds.uncond.c_position_ids     = embeds.cond.c_position_ids;
+                embeds.uncond.c_visual_cond_augs = latents.visual_cond_augs;
             }
             if (sd->version == VERSION_WAN2_2_S2V) {
                 embeds.uncond.c_ref_images = latents.ref_latents;
@@ -1609,6 +1693,10 @@ namespace sd::pipeline {
                      request.height,
                      request.frames);
         } else {
+            if (getenv("SD_XPU_H3_LIB") != nullptr && sd->model_manager != nullptr) {
+                // the XPU transformer blocks allocate through Level Zero on the same GPU
+                sd->model_manager->release_idle_device_memory();
+            }
             LOG_INFO("generate_video %dx%dx%d",
                      request.width,
                      request.height,
@@ -1710,6 +1798,14 @@ namespace sd::pipeline {
             return false;
         }
         LOG_INFO("sampling completed, taking %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
+        if (const char* xpu_lib = getenv("SD_XPU_H3_LIB")) {
+            // hand the GPU back to Vulkan for the VAE decode
+            if (void* lib = dlopen(xpu_lib, RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD)) {
+                if (auto release = reinterpret_cast<void (*)()>(dlsym(lib, "xpu_h3_release"))) {
+                    release();
+                }
+            }
+        }
 
         if (latent_upscale_enabled) {
             if (sd->get_cancel_flag() == SD_CANCEL_ALL) {

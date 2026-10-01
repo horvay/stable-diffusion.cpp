@@ -176,6 +176,8 @@ namespace sd::pipeline {
         strength                    = sd_vid_gen_params->strength;
         cache_params                = &sd_vid_gen_params->cache;
         vace_strength               = sd_vid_gen_params->vace_strength;
+        init_image_strength         = sd_vid_gen_params->init_image_strength;
+        end_image_strength          = sd_vid_gen_params->end_image_strength;
         guidance                    = sd_vid_gen_params->sample_params.guidance;
         high_noise_guidance         = sd_vid_gen_params->high_noise_sample_params.guidance;
         hires                       = sd_vid_gen_params->hires;

@@ -54,6 +54,12 @@ Add `--init-img` for I2VA, or both `--init-img` and `--end-img` for FL2VA:
 .\bin\Release\sd-cli.exe -M vid_gen --diffusion-model  ..\models\diffusion_models\minimax_h3_fl2va-Q4_K_M.gguf --vae ..\models\vae\minimax_h3_video_vae_fp16.safetensors --audio-vae ..\models\vae\minimax_h3_audio_vae_fp32.safetensors --llm ..\models\text_encoders\qwen3vl_32b_minimax_h3-Q4_K_M.gguf -p "a lovely cat" -i ..\assets\ernie_image\turbo_example.png --cfg-scale 1.0 -v -W 864 -H 480 --diffusion-fa --offload-to-cpu --rng cpu --fps 24 --video-frames 56
 ```
 
+`--init-img-strength` and `--end-img-strength` (default `1.0`) map to Comfy's
+`visual_cond_noise_aug`. `1.0` pins that keyframe at t=0.999. Lower values mix
+noise into the cond latent and lower its timestep pin. `0` skips that frame.
+Start and end can differ.
+
+
 <video src=../assets/minimax-h3/i2av.mp4 controls="controls" muted="muted" type="video/mp4"></video>
 
 ## Reference-to-audio-video conditioning

@@ -215,6 +215,8 @@ struct SDGenerationParams {
 
     std::string init_image_path;
     std::string end_image_path;
+    float init_image_strength = 1.0f;
+    float end_image_strength  = 1.0f;
     std::string mask_image_path;
     std::string control_image_path;
     std::string ip_adapter_image_path;
@@ -222,6 +224,8 @@ struct SDGenerationParams {
     std::vector<std::string> ref_video_paths;
     std::vector<std::string> ref_video_audio_paths;
     std::vector<std::string> ref_audio_paths;
+    std::vector<std::string> guide_specs;        // MiniMax-H3 image guides: PATH@FRAME[@STRENGTH]
+    std::vector<std::string> guide_audio_specs;  // MiniMax-H3 audio guides: PATH@FRAME
     std::string control_video_path;
 
     sd_sample_params_t sample_params;
@@ -289,6 +293,11 @@ struct SDGenerationParams {
     std::vector<std::vector<SDImageOwner>> ref_videos;
     std::vector<SDAudioOwner> ref_video_audios;
     std::vector<SDAudioOwner> ref_audios;
+    std::vector<SDImageOwner> guide_images;
+    std::vector<SDAudioOwner> guide_audios;
+    std::vector<int> guide_frame_idxs;
+    std::vector<float> guide_strengths;
+    std::vector<int> guide_audio_frame_idxs;
     SDImageOwner mask_image;
     SDImageOwner control_image;
     SDImageOwner ip_adapter_image;
@@ -300,6 +309,7 @@ struct SDGenerationParams {
     std::vector<std::vector<sd_image_t>> ref_video_frame_views;
     std::vector<sd_ref_video_t> ref_video_views;
     std::vector<sd_audio_t> ref_audio_views;
+    std::vector<sd_minimax_guide_t> guide_views;
     std::vector<sd_image_t> pm_id_image_views;
     std::vector<sd_image_t> control_frame_views;
 

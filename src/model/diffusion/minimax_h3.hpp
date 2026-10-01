@@ -2,6 +2,7 @@
 #define __SD_MODEL_DIFFUSION_MINIMAX_H3_HPP__
 
 #include <algorithm>
+#include <dlfcn.h>
 #include <cinttypes>
 #include <cmath>
 #include <set>
@@ -138,6 +139,16 @@ namespace MiniMaxH3 {
         }
     };
 
+    // Token rows per projection chunk (SD_H3_TOKEN_CHUNK, 0 disables). Keeps every activation
+    // below the 4 GiB Vulkan storage-buffer limit at high resolution.
+    static int64_t token_chunk_size() {
+        static const int64_t value = [] {
+            const char* env = getenv("SD_H3_TOKEN_CHUNK");
+            return env != nullptr ? static_cast<int64_t>(std::atoll(env)) : int64_t(16384);
+        }();
+        return value;
+    }
+
     struct MLP : public UnaryBlock {
         MLP(int64_t hidden_size,
             int64_t ffn_hidden_size) {
@@ -145,13 +156,32 @@ namespace MiniMaxH3 {
             blocks["fc2"] = std::make_shared<Linear>(ffn_hidden_size, hidden_size, false, false, true, 1.f / 128.f);
         }
 
-        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
+        ggml_tensor* forward_rows(GGMLRunnerContext* ctx, ggml_tensor* x) {
             auto fc1 = std::dynamic_pointer_cast<Linear>(blocks["fc1"]);
             auto fc2 = std::dynamic_pointer_cast<Linear>(blocks["fc2"]);
             auto uv  = ggml_ext_chunk(ctx->ggml_ctx, fc1->forward(ctx, x), 2, 0);
             return fc2->forward(ctx, ggml_mul(ctx->ggml_ctx,
                                               ggml_silu(ctx->ggml_ctx, uv[0]),
                                               uv[1]));
+        }
+
+        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
+            // fc1 output is 2 * ffn_hidden_size floats per token; at ~44k tokens it passes the 4 GiB
+            // Vulkan storage-buffer limit and the whole MLP falls back to CPU. Run it in token chunks.
+            const int64_t chunk = token_chunk_size();
+            const int64_t rows  = ggml_nrows(x);
+            if (chunk <= 0 || rows <= chunk) {
+                return forward_rows(ctx, x);
+            }
+            auto flat       = ggml_reshape_2d(ctx->ggml_ctx, ggml_ext_cont(ctx->ggml_ctx, x), x->ne[0], rows);
+            ggml_tensor* out = nullptr;
+            for (int64_t start = 0; start < rows; start += chunk) {
+                int64_t len = std::min(chunk, rows - start);
+                auto part   = ggml_view_2d(ctx->ggml_ctx, flat, flat->ne[0], len, flat->nb[1], start * flat->nb[1]);
+                auto y      = forward_rows(ctx, part);
+                out         = out == nullptr ? y : ggml_concat(ctx->ggml_ctx, out, y, 1);
+            }
+            return ggml_reshape_4d(ctx->ggml_ctx, out, out->ne[0], x->ne[1], x->ne[2], x->ne[3]);
         }
     };
 
@@ -202,7 +232,26 @@ namespace MiniMaxH3 {
 
             int64_t sequence = x->ne[1];
             int64_t batch    = x->ne[2] * x->ne[3];
-            auto qkv         = ggml_ext_chunk(ctx->ggml_ctx, qkv_proj->forward(ctx, x), 3, 0);
+            std::vector<ggml_tensor*> qkv;
+            const int64_t chunk = token_chunk_size();
+            const int64_t rows  = sequence * batch;
+            if (chunk <= 0 || rows <= chunk) {
+                qkv = ggml_ext_chunk(ctx->ggml_ctx, qkv_proj->forward(ctx, x), 3, 0);
+            } else {
+                // Project per token chunk and concatenate q/k/v separately so the fused
+                // [3 * inner, tokens] tensor never exists.
+                auto flat = ggml_reshape_2d(ctx->ggml_ctx, ggml_ext_cont(ctx->ggml_ctx, x), x->ne[0], rows);
+                qkv.assign(3, nullptr);
+                for (int64_t start = 0; start < rows; start += chunk) {
+                    int64_t len = std::min(chunk, rows - start);
+                    auto part   = ggml_view_2d(ctx->ggml_ctx, flat, flat->ne[0], len, flat->nb[1], start * flat->nb[1]);
+                    auto pieces = ggml_ext_chunk(ctx->ggml_ctx, qkv_proj->forward(ctx, part), 3, 0);
+                    for (int i = 0; i < 3; ++i) {
+                        auto piece = ggml_cont(ctx->ggml_ctx, pieces[i]);
+                        qkv[i]     = qkv[i] == nullptr ? piece : ggml_concat(ctx->ggml_ctx, qkv[i], piece, 1);
+                    }
+                }
+            }
             auto q           = ggml_reshape_4d(ctx->ggml_ctx, qkv[0], head_dim, heads, sequence, batch);
             auto k           = ggml_reshape_4d(ctx->ggml_ctx, qkv[1], head_dim, heads, sequence, batch);
             auto v           = ggml_reshape_4d(ctx->ggml_ctx, qkv[2], head_dim, heads, sequence, batch);
@@ -489,6 +538,32 @@ namespace MiniMaxH3 {
         }
     };
 
+    using XpuH3BlocksFn = int (*)(const float*, int64_t, int64_t, const float*, int64_t, int64_t, const float*, int64_t,
+                                  const int64_t*, int64_t, int64_t, int64_t, float*, int);
+
+    // SD_XPU_H3_LIB=path/to/libxpu_h3.so runs the transformer blocks through libtorch on an Intel XPU.
+    static XpuH3BlocksFn xpu_h3_blocks_fn() {
+        static const XpuH3BlocksFn fn = []() -> XpuH3BlocksFn {
+            const char* path = getenv("SD_XPU_H3_LIB");
+            if (path == nullptr || *path == '\0') {
+                return nullptr;
+            }
+            void* lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+            if (lib == nullptr) {
+                LOG_ERROR("SD_XPU_H3_LIB: dlopen failed: %s", dlerror());
+                return nullptr;
+            }
+            auto f = reinterpret_cast<XpuH3BlocksFn>(dlsym(lib, "xpu_h3_blocks"));
+            if (f == nullptr) {
+                LOG_ERROR("SD_XPU_H3_LIB: xpu_h3_blocks not found");
+            } else {
+                LOG_INFO("MiniMax-H3 transformer blocks on XPU: %s", path);
+            }
+            return f;
+        }();
+        return fn;
+    }
+
     struct MiniMaxH3Transformer3DModel : public GGMLBlock {
         Config config;
 
@@ -688,7 +763,40 @@ namespace MiniMaxH3 {
                                         curve_upper_indices,
                                         curve_fractions);
             auto pe    = build_rope(ctx, position_ids);
-            for (int64_t i = 0; i < config.num_layers; ++i) {
+            if (auto blocks_fn = xpu_h3_blocks_fn()) {
+                // All transformer blocks on an Intel XPU through libtorch (SD_XPU_H3_LIB); see xpu_sdpa/xpu_h3.cpp.
+                struct XpuH3Args {
+                    XpuH3BlocksFn fn;
+                    std::vector<int64_t> segments;
+                    int64_t heads;
+                    int64_t head_dim;
+                };
+                auto* ud     = new XpuH3Args{blocks_fn, {}, config.num_attention_heads, config.attention_head_dim};
+                for (const auto& seg : segments) {
+                    ud->segments.insert(ud->segments.end(), {seg.start, seg.end, seg.modulation_row});
+                }
+                ggml_tensor* args[3] = {ggml_cont(ctx->ggml_ctx, h),
+                                        ggml_cont(ctx->ggml_ctx, t_emb),
+                                        ggml_cont(ctx->ggml_ctx, pe)};
+                auto op = [](ggml_tensor* dst, int ith, int, void* userdata) {
+                    if (ith != 0) {
+                        return;
+                    }
+                    static const bool verbose = getenv("SD_XPU_H3_VERBOSE") != nullptr;
+                    auto* a        = static_cast<XpuH3Args*>(userdata);
+                    const auto* hh = dst->src[0];
+                    const auto* tt = dst->src[1];
+                    const auto* pp = dst->src[2];
+                    int rc         = a->fn(static_cast<const float*>(hh->data), ggml_nrows(hh), hh->ne[0],
+                                           static_cast<const float*>(tt->data), ggml_nrows(tt), tt->ne[0],
+                                           static_cast<const float*>(pp->data), pp->ne[2],
+                                           a->segments.data(), static_cast<int64_t>(a->segments.size() / 3),
+                                           a->heads, a->head_dim, static_cast<float*>(dst->data), verbose ? 1 : 0);
+                    GGML_ASSERT(rc == 0 && "xpu_h3_blocks failed");
+                };
+                h = ggml_custom_4d(ctx->ggml_ctx, GGML_TYPE_F32, h->ne[0], h->ne[1], h->ne[2], h->ne[3], args, 3, op, 1, ud);
+            }
+            for (int64_t i = 0; i < config.num_layers && xpu_h3_blocks_fn() == nullptr; ++i) {
                 auto block = std::dynamic_pointer_cast<TransformerBlock>(blocks["blocks." + std::to_string(i)]);
                 h          = block->forward(ctx, h, t_emb, segments, pe);
                 sd::ggml_graph_cut::mark_graph_cut(h,
@@ -766,7 +874,8 @@ namespace MiniMaxH3 {
                                              const std::vector<MiniMaxH3ReferenceBlock>& reference_blocks,
                                              const sd::Tensor<int32_t>& text_tags,
                                              float video_t,
-                                             float audio_timestep) {
+                                             float audio_timestep,
+                                             const std::vector<float>& visual_cond_augs) {
         PackedSequenceLayout layout;
         float sqrt_area    = std::sqrt(static_cast<float>(latent_h * latent_w));
         auto h_axis        = spatial_axis(latent_h, sqrt_area);
@@ -860,11 +969,76 @@ namespace MiniMaxH3 {
                                                     row + count,
                                                     SequenceKind::CONDITION_VIDEO,
                                                     static_cast<int32_t>(index)});
-                layout.segments.push_back({row, row + count, condition_time_row * 3});
+                float aug      = index < visual_cond_augs.size() ? visual_cond_augs[index] : VISUAL_COND_TIMESTEP;
+                int time_row   = find_or_add_timestep(&layout.timesteps, std::max(video_t, aug));
+                layout.segments.push_back({row, row + count, time_row * 3});
                 row += count;
             }
         } else {
+            // Guides sit right after text; their anchors count from the target timeline
+            // origin, which starts after every reference block's span.
+            float target_origin = cursor;
             for (const auto& block : reference_blocks) {
+                if (block.kind == MiniMaxH3ReferenceKind::GUIDE) {
+                    continue;
+                }
+                float span = 0.f;
+                if (block.audio_index >= 0) {
+                    span = static_cast<float>(condition_audios[static_cast<size_t>(block.audio_index)].shape()[0]);
+                }
+                if (block.kind == MiniMaxH3ReferenceKind::IMAGE) {
+                    span = std::max(span, 1.f);
+                } else if (block.video_index >= 0) {
+                    float video_end = 0.f;
+                    for (int64_t t = 0; t < condition_videos[static_cast<size_t>(block.video_index)].shape()[2]; ++t) {
+                        video_end += video_span(t);
+                    }
+                    span = std::max(span, video_end);
+                }
+                target_origin += span;
+            }
+            for (const auto& block : reference_blocks) {
+                if (block.kind != MiniMaxH3ReferenceKind::GUIDE) {
+                    continue;
+                }
+                float cond_t = target_origin + FRAME_RESCALE * static_cast<float>(block.frame_index);
+                if (block.video_index >= 0) {
+                    GGML_ASSERT(block.video_index < static_cast<int32_t>(condition_videos.size()));
+                    const auto& condition = condition_videos[static_cast<size_t>(block.video_index)];
+                    auto axes             = condition_spatial_axes(condition);
+                    int64_t count         = condition.shape()[2] *
+                                    static_cast<int64_t>(axes.first.size() * axes.second.size());
+                    append_video_positions(condition, cond_t);
+                    layout.sequence_segments.push_back({row,
+                                                        row + count,
+                                                        SequenceKind::CONDITION_VIDEO,
+                                                        block.video_index});
+                    size_t aug_index = static_cast<size_t>(block.video_index);
+                    float aug        = aug_index < visual_cond_augs.size() ? visual_cond_augs[aug_index] : VISUAL_COND_TIMESTEP;
+                    int time_row     = find_or_add_timestep(&layout.timesteps, std::max(video_t, aug));
+                    layout.segments.push_back({row, row + count, time_row * 3});
+                    row += count;
+                }
+                if (block.audio_index >= 0) {
+                    GGML_ASSERT(block.audio_index < static_cast<int32_t>(condition_audios.size()));
+                    int64_t length = condition_audios[static_cast<size_t>(block.audio_index)].shape()[0];
+                    int64_t count  = length * 2;
+                    append_audio_positions(length, cond_t, w_axis.front(), w_axis.back());
+                    layout.sequence_segments.push_back({row,
+                                                        row + count,
+                                                        SequenceKind::CONDITION_AUDIO,
+                                                        block.audio_index});
+                    layout.segments.push_back({row,
+                                               row + count,
+                                               audio_condition_time_row * 3 + 2});
+                    row += count;
+                }
+            }
+
+            for (const auto& block : reference_blocks) {
+                if (block.kind == MiniMaxH3ReferenceKind::GUIDE) {
+                    continue;
+                }
                 const sd::Tensor<float>* ref_video = nullptr;
                 const sd::Tensor<float>* ref_audio = nullptr;
                 if (block.video_index >= 0) {
@@ -970,6 +1144,9 @@ namespace MiniMaxH3 {
               config(Config::detect_from_weights(tensors, prefix)),
               model(config) {
             model.init(params_ctx, tensors, prefix);
+            // XPU block weights load lazily at the first denoising step: video.cpp releases Vulkan's idle
+            // memory just before sampling and calls xpu_h3_release() right after, so the text encoder and
+            // VAE keep the whole GPU.
         }
 
         std::string get_desc() override {
@@ -1033,7 +1210,8 @@ namespace MiniMaxH3 {
                                  const std::vector<MiniMaxH3ReferenceBlock>& reference_blocks,
                                  int audio_length,
                                  float video_shift,
-                                 float audio_shift) {
+                                 float audio_shift,
+                                 const std::vector<float>& visual_cond_augs) {
             auto split        = split_av_latents(packed, audio_length);
             video_input_cache = std::move(split.first);
             audio_input_cache = std::move(split.second);
@@ -1073,7 +1251,8 @@ namespace MiniMaxH3 {
                                        reference_blocks,
                                        text_tags,
                                        t_v,
-                                       t_a);
+                                       t_a,
+                                       visual_cond_augs);
 
             position_input_cache = sd::Tensor<float>(
                 {3, static_cast<int64_t>(layout.positions.size() / 3)},
@@ -1153,6 +1332,7 @@ namespace MiniMaxH3 {
             const auto* extra = diffusion_extra_as<MiniMaxH3DiffusionExtra>(params);
             static const std::vector<sd::Tensor<float>> empty_conditions;
             static const std::vector<MiniMaxH3ReferenceBlock> empty_reference_blocks;
+            static const std::vector<float> empty_visual_cond_augs;
             const auto& conditions       = params.ref_latents == nullptr ? empty_conditions : *params.ref_latents;
             const auto& audio_conditions = extra->reference_audio_latents == nullptr
                                                ? empty_conditions
@@ -1160,6 +1340,9 @@ namespace MiniMaxH3 {
             const auto& reference_blocks = extra->reference_blocks == nullptr
                                                ? empty_reference_blocks
                                                : *extra->reference_blocks;
+            const auto& visual_cond_augs = extra->visual_cond_noise_augs == nullptr
+                                               ? empty_visual_cond_augs
+                                               : *extra->visual_cond_noise_augs;
             const sd::Tensor<int32_t> empty_int;
             auto get_graph = [&]() {
                 return build_graph(*params.x,
@@ -1172,7 +1355,8 @@ namespace MiniMaxH3 {
                                    reference_blocks,
                                    extra->audio_length,
                                    extra->video_sigma_shift,
-                                   extra->audio_sigma_shift);
+                                   extra->audio_sigma_shift,
+                                   visual_cond_augs);
             };
             return restore_trailing_singleton_dims(GGMLRunner::compute(get_graph,
                                                                        n_threads,

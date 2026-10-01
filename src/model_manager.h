@@ -265,6 +265,9 @@ public:
     }
 
     bool validate_registered_tensors();
+    // Drop every unpinned device-side weight copy and reclaim idle runner workspaces, e.g. before an
+    // external allocator on the same GPU (the XPU transformer-block library) needs the memory.
+    void release_idle_device_memory();
     bool load_all_params_eagerly();
 
     bool assign_compute_backend(const std::vector<ggml_tensor*>& tensors,

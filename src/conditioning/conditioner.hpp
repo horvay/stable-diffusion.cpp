@@ -36,6 +36,7 @@ struct SDCondition {
     std::vector<sd::Tensor<float>> c_ref_images;
     std::vector<sd::Tensor<float>> c_ref_audios;
     std::vector<MiniMaxH3ReferenceBlock> c_reference_blocks;
+    std::vector<float> c_visual_cond_augs;
 
     std::vector<sd::Tensor<float>> extra_c_crossattns;
 

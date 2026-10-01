@@ -1279,6 +1279,14 @@ ArgOptions SDGenerationParams::get_options() {
          "strength for noising/unnoising (default: 0.75)",
          &strength},
         {"",
+         "--init-img-strength",
+         "MiniMax-H3 first-frame keyframe strength (default: 1.0)",
+         &init_image_strength},
+        {"",
+         "--end-img-strength",
+         "MiniMax-H3 last-frame keyframe strength (default: 1.0)",
+         &end_image_strength},
+        {"",
          "--pm-style-strength",
          "",
          &pm_style_strength},
@@ -1544,6 +1552,22 @@ ArgOptions SDGenerationParams::get_options() {
         return 1;
     };
 
+    auto on_guide_arg = [&](int argc, const char** argv, int index) {
+        if (++index >= argc) {
+            return -1;
+        }
+        guide_specs.push_back(argv[index]);
+        return 1;
+    };
+
+    auto on_guide_audio_arg = [&](int argc, const char** argv, int index) {
+        if (++index >= argc) {
+            return -1;
+        }
+        guide_audio_specs.push_back(argv[index]);
+        return 1;
+    };
+
     auto on_audio_arg = [&](int argc, const char** argv, int index) {
         if (++index >= argc) {
             return -1;
@@ -1741,6 +1765,15 @@ ArgOptions SDGenerationParams::get_options() {
          "--ref-audio",
          "standalone WAV reference for MiniMax-H3 Ref2VA (can be used multiple times)",
          on_ref_audio_arg},
+        {"",
+         "--guide",
+         "MiniMax-H3 image guide PATH@FRAME[@STRENGTH] anchored at a target frame, combinable with Ref2VA "
+         "(negative FRAME counts from the end; can be used multiple times)",
+         on_guide_arg},
+        {"",
+         "--guide-audio",
+         "MiniMax-H3 WAV guide PATH@FRAME anchored at a target frame (can be used multiple times)",
+         on_guide_audio_arg},
         {"",
          "--audio",
          "driving audio track (Wan2.2 S2V; can be used once)",
@@ -2100,6 +2133,8 @@ bool SDGenerationParams::from_json_str(
     load_if_exists("seed", seed);
 
     load_if_exists("strength", strength);
+    load_if_exists("init_image_strength", init_image_strength);
+    load_if_exists("end_image_strength", end_image_strength);
     load_if_exists("control_strength", control_strength);
     load_if_exists("ip_adapter_strength", ip_adapter_strength);
     load_if_exists("moe_boundary", moe_boundary);
@@ -2780,6 +2815,22 @@ sd_vid_gen_params_t SDGenerationParams::to_sd_vid_gen_params_t() {
                                    audio});
     }
 
+    guide_views.clear();
+    for (size_t i = 0; i < guide_images.size(); ++i) {
+        sd_minimax_guide_t guide = {};
+        guide.image              = guide_images[i].get();
+        guide.frame_idx          = guide_frame_idxs[i];
+        guide.strength           = guide_strengths[i];
+        guide_views.push_back(guide);
+    }
+    for (size_t i = 0; i < guide_audios.size(); ++i) {
+        sd_minimax_guide_t guide = {};
+        guide.audio              = guide_audios[i].get();
+        guide.frame_idx          = guide_audio_frame_idxs[i];
+        guide.strength           = 1.f;
+        guide_views.push_back(guide);
+    }
+
     ref_audio_views.clear();
     ref_audio_views.reserve(ref_audios.size());
     for (auto& audio : ref_audios) {
@@ -2803,13 +2854,17 @@ sd_vid_gen_params_t SDGenerationParams::to_sd_vid_gen_params_t() {
     params.negative_prompt           = negative_prompt.c_str();
     params.clip_skip                 = clip_skip;
     params.init_image                = init_image.get();
+    params.init_image_strength       = init_image_strength;
     params.end_image                 = end_image.get();
+    params.end_image_strength        = end_image_strength;
     params.ref_images                = ref_image_views.empty() ? nullptr : ref_image_views.data();
     params.ref_images_count          = static_cast<int>(ref_image_views.size());
     params.ref_videos                = ref_video_views.empty() ? nullptr : ref_video_views.data();
     params.ref_videos_count          = static_cast<int>(ref_video_views.size());
     params.ref_audios                = ref_audio_views.empty() ? nullptr : ref_audio_views.data();
     params.ref_audios_count          = static_cast<int>(ref_audio_views.size());
+    params.guides                    = guide_views.empty() ? nullptr : guide_views.data();
+    params.guides_count              = static_cast<int>(guide_views.size());
     params.control_frames            = control_frame_views.empty() ? nullptr : control_frame_views.data();
     params.control_frames_size       = static_cast<int>(control_frame_views.size());
     params.width                     = get_resolved_width();
@@ -2887,6 +2942,8 @@ std::string SDGenerationParams::to_string() const {
         << "  qwen_image_layers: " << qwen_image_layers << ",\n"
         << "  init_image_path: \"" << init_image_path << "\",\n"
         << "  end_image_path: \"" << end_image_path << "\",\n"
+        << "  init_image_strength: " << init_image_strength << ",\n"
+        << "  end_image_strength: " << end_image_strength << ",\n"
         << "  mask_image_path: \"" << mask_image_path << "\",\n"
         << "  control_image_path: \"" << control_image_path << "\",\n"
         << "  ref_image_paths: " << vec_str_to_string(ref_image_paths) << ",\n"

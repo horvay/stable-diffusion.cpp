@@ -821,6 +821,62 @@ int main(int argc, const char* argv[]) {
         }
     }
 
+    auto split_spec = [](const std::string& spec, std::string& path, int& frame, float& strength) -> bool {
+        std::vector<std::string> parts;
+        size_t at = spec.find('@');
+        path      = spec.substr(0, at);
+        while (at != std::string::npos) {
+            size_t start = at + 1;
+            at           = spec.find('@', start);
+            parts.push_back(spec.substr(start, at == std::string::npos ? std::string::npos : at - start));
+        }
+        if (path.empty() || parts.empty() || parts.size() > 2) {
+            return false;
+        }
+        try {
+            frame    = std::stoi(parts[0]);
+            strength = parts.size() > 1 ? std::stof(parts[1]) : 1.f;
+        } catch (...) {
+            return false;
+        }
+        return true;
+    };
+
+    gen_params.guide_images.clear();
+    gen_params.guide_frame_idxs.clear();
+    gen_params.guide_strengths.clear();
+    for (const auto& spec : gen_params.guide_specs) {
+        std::string path;
+        int frame      = 0;
+        float strength = 1.f;
+        if (!split_spec(spec, path, frame, strength)) {
+            LOG_ERROR("invalid --guide '%s', expected PATH@FRAME[@STRENGTH]", spec.c_str());
+            return 1;
+        }
+        SDImageOwner image({0, 0, 0, nullptr});
+        if (!load_image_and_update_size(path, image)) {
+            return 1;
+        }
+        gen_params.guide_images.push_back(std::move(image));
+        gen_params.guide_frame_idxs.push_back(frame);
+        gen_params.guide_strengths.push_back(strength);
+    }
+
+    gen_params.guide_audios.clear();
+    gen_params.guide_audio_frame_idxs.clear();
+    gen_params.guide_audios.resize(gen_params.guide_audio_specs.size());
+    for (size_t i = 0; i < gen_params.guide_audio_specs.size(); ++i) {
+        std::string path;
+        int frame      = 0;
+        float strength = 1.f;
+        if (!split_spec(gen_params.guide_audio_specs[i], path, frame, strength) ||
+            !load_audio(path, gen_params.guide_audios[i])) {
+            LOG_ERROR("invalid --guide-audio '%s', expected PATH@FRAME", gen_params.guide_audio_specs[i].c_str());
+            return 1;
+        }
+        gen_params.guide_audio_frame_idxs.push_back(frame);
+    }
+
     if (gen_params.mask_image_path.size() > 0) {
         if (!load_sd_image_from_file(gen_params.mask_image.put(),
                                      gen_params.mask_image_path.c_str(),

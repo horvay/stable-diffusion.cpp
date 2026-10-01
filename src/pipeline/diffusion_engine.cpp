@@ -2539,7 +2539,8 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
                     condition.c_reference_blocks.empty() ? nullptr : &condition.c_reference_blocks,
                     audio_length,
                     std::isfinite(active_flow_shift) ? active_flow_shift : 12.f,
-                    3.f};
+                    3.f,
+                    condition.c_visual_cond_augs.empty() ? nullptr : &condition.c_visual_cond_augs};
             } else if (sd_version_is_ltxav(version)) {
                 diffusion_params.extra = LTXAVDiffusionExtra{
                     nullptr,

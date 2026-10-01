@@ -1,6 +1,9 @@
 #include "core/ggml_extend.h"
 
 #include <cmath>
+#include <dlfcn.h>
+
+#include "core/util.h"
 #include <stdexcept>
 #include <utility>
 
@@ -760,6 +763,137 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         }
     }
 #endif
+
+    // Attention offload to an Intel XPU through libtorch (SD_XPU_SDPA_LIB=path/to/libxpu_sdpa.so).
+    // On Arc Pro B70 its oneDNN/SYCL kernels run ~5x faster than any Vulkan FA path, because Vulkan
+    // compute on Xe2 is limited to 128 GRFs. Q/K/V are cast to head-major f16 on the device; a CPU-side
+    // custom op calls the library, and the scheduler moves the tensors across PCIe.
+    using xpu_sdpa_fn = int (*)(const void*, const void*, const void*, void*, int64_t, int64_t, int64_t,
+                                int64_t, int64_t, double, int);
+    static const xpu_sdpa_fn xpu_sdpa = []() -> xpu_sdpa_fn {
+        const char* path = getenv("SD_XPU_SDPA_LIB");
+        if (path == nullptr) {
+            return nullptr;
+        }
+        void* lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+        if (lib == nullptr) {
+            LOG_ERROR("SD_XPU_SDPA_LIB: dlopen failed: %s", dlerror());
+            return nullptr;
+        }
+        auto fn = reinterpret_cast<xpu_sdpa_fn>(dlsym(lib, "xpu_sdpa_f16"));
+        if (fn == nullptr) {
+            LOG_ERROR("SD_XPU_SDPA_LIB: xpu_sdpa_f16 not found");
+        } else {
+            LOG_INFO("attention offload: %s", path);
+        }
+        return fn;
+    }();
+    if (kqv == nullptr && xpu_sdpa != nullptr && skip_reshape && mask == nullptr && N == 1 &&
+        q->type == GGML_TYPE_F32 && ggml_n_dims(q) <= 3 && n_head % n_kv_head == 0) {
+        auto q_in = ggml_cast(ctx, ggml_reshape_3d(ctx, ggml_ext_cont(ctx, q), d_head, L_q, n_head), GGML_TYPE_F16);
+        auto k_in = ggml_reshape_3d(ctx, ggml_ext_cont(ctx, k), d_head, L_k, n_kv_head);
+        auto v_in = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, ggml_ext_cont(ctx, v), d_head, n_kv_head, L_k), 0, 2, 1, 3));
+        if (kv_scale != 1.0f) {
+            k_in = ggml_ext_scale(ctx, k_in, kv_scale);
+            v_in = ggml_ext_scale(ctx, v_in, kv_scale);
+        }
+        k_in = ggml_cast(ctx, k_in, GGML_TYPE_F16);  // [d, L_k, H_kv] = head-major
+        v_in = ggml_cast(ctx, v_in, GGML_TYPE_F16);
+        ggml_tensor* args[3] = {q_in, k_in, v_in};
+        struct XpuArgs {
+            xpu_sdpa_fn fn;
+            float scale;
+        };
+        static XpuArgs xpu_args;
+        xpu_args.fn    = xpu_sdpa;
+        xpu_args.scale = scale / kv_scale;
+        auto op = [](ggml_tensor* dst, int ith, int, void* userdata) {
+            if (ith != 0) {
+                return;
+            }
+            static const bool verbose = getenv("SD_XPU_SDPA_VERBOSE") != nullptr;
+            auto* a          = static_cast<XpuArgs*>(userdata);
+            const auto* qq   = dst->src[0];
+            const auto* kk   = dst->src[1];
+            const auto* vv   = dst->src[2];
+            int rc = a->fn(qq->data, kk->data, vv->data, dst->data,
+                           qq->ne[2], qq->ne[1], kk->ne[1], kk->ne[2], qq->ne[0], a->scale, verbose ? 1 : 0);
+            GGML_ASSERT(rc == 0 && "xpu_sdpa failed");
+        };
+        // f16 output halves the device->host->device traffic; cast back on the Vulkan side
+        auto out = ggml_custom_4d(ctx, GGML_TYPE_F16, d_head, n_head, L_q, 1, args, 3, op, 1, &xpu_args);
+        out      = ggml_cast(ctx, out, GGML_TYPE_F32);
+        if (kv_scale != 1.0f) {
+            out = ggml_ext_scale(ctx, out, 1.0f / kv_scale);
+        }
+        if (used_flash_attn != nullptr) {
+            *used_flash_attn = true;
+        }
+        kqv = ggml_view_4d(ctx, out, d_head, n_head, L_q, N, out->nb[1], out->nb[2], out->nb[1] * n_head, 0);
+    }
+
+    // Intel Xe2 Vulkan prefill flash attention wants head-interleaved Q/K/V ([d, L, H] views over
+    // [d, H, L] memory) and an unmasked KV length that is a multiple of 32. Pad K/V with zeros and
+    // record the real key count in op_params[5]; the kernel gives the padded keys -inf.
+    static const bool xe_fa = getenv("SD_VK_XE_FA") != nullptr;
+    if (kqv == nullptr && flash_attn && xe_fa && skip_reshape && mask == nullptr &&
+        sd_backend_is(backend, "Vulkan") && d_head % 32 == 0 && q->type == GGML_TYPE_F32 && ggml_n_dims(q) <= 3) {
+        // pad to the kernel's keys-per-iteration (GGML_VK_XE_FA_PITER, up to 64) so the last tile stays in bounds
+        const int64_t L_k_pad = (L_k + 63) / 64 * 64;
+        auto q_in             = ggml_reshape_4d(ctx, ggml_ext_cont(ctx, q), d_head, L_q, n_head, N);
+        q_in                  = ggml_cont(ctx, ggml_permute(ctx, q_in, 0, 2, 1, 3));  // [d, H, L_q, N]
+        q_in                  = ggml_permute(ctx, q_in, 0, 2, 1, 3);                  // view [d, L_q, H, N]
+
+        auto k_in = ggml_reshape_4d(ctx, ggml_ext_cont(ctx, k), d_head, L_k, n_kv_head, N);
+        if (kv_scale != 1.0f) {
+            k_in = ggml_ext_scale(ctx, k_in, kv_scale);
+        }
+        if (L_k_pad != L_k) {
+            k_in = ggml_pad(ctx, k_in, 0, static_cast<int>(L_k_pad - L_k), 0, 0);
+        }
+        k_in = ggml_cast(ctx, ggml_permute(ctx, k_in, 0, 2, 1, 3), GGML_TYPE_F16);  // [d, H, L_k_pad, N]
+        k_in = ggml_permute(ctx, k_in, 0, 2, 1, 3);                                 // view [d, L_k_pad, H, N]
+
+        auto v_in = ggml_reshape_4d(ctx, ggml_ext_cont(ctx, v), d_head, n_kv_head, L_k, N);  // [d, H, L_k, N]
+        if (kv_scale != 1.0f) {
+            v_in = ggml_ext_scale(ctx, v_in, kv_scale);
+        }
+        if (L_k_pad != L_k) {
+            v_in = ggml_pad(ctx, v_in, 0, 0, static_cast<int>(L_k_pad - L_k), 0);
+        }
+        v_in = ggml_cast(ctx, v_in, GGML_TYPE_F16);
+        v_in = ggml_permute(ctx, v_in, 0, 2, 1, 3);  // view [d, L_k_pad, H, N]
+
+        // Split queries so no single dispatch outlives the GPU job timeout (xe: 5 s by default).
+        static const int64_t q_chunk = [] {
+            const char* value = getenv("SD_VK_XE_FA_QCHUNK");
+            return value != nullptr ? std::max<int64_t>(256, std::atoll(value)) : int64_t(8192);
+        }();
+        ggml_tensor* out = nullptr;
+        bool supported   = true;
+        for (int64_t start = 0; start < L_q && supported; start += q_chunk) {
+            int64_t len  = std::min(q_chunk, L_q - start);
+            auto q_chunk_in = ggml_view_4d(ctx, q_in, d_head, len, n_head, N,
+                                           q_in->nb[1], q_in->nb[2], q_in->nb[3], start * q_in->nb[1]);
+            auto part = ggml_flash_attn_ext(ctx, q_chunk_in, k_in, v_in, nullptr, scale / kv_scale, 0, 0);
+            if (!ggml_backend_supports_op(backend, part)) {
+                supported = false;
+                break;
+            }
+            ggml_flash_attn_ext_set_prec(part, GGML_PREC_F32);
+            part->op_params[5] = static_cast<int32_t>(L_k);  // read by the Vulkan Xe prefill kernel
+            out                = out == nullptr ? part : ggml_concat(ctx, out, part, 2);  // [d, H, L_q, N]
+        }
+        if (supported && out != nullptr) {
+            if (kv_scale != 1.0f) {
+                out = ggml_ext_scale(ctx, out, 1.0f / kv_scale);
+            }
+            if (used_flash_attn != nullptr) {
+                *used_flash_attn = true;
+            }
+            kqv = ggml_view_4d(ctx, out, d_head, n_head, L_q, N, out->nb[1], out->nb[2], out->nb[1] * n_head, 0);
+        }
+    }
 
     if (kqv == nullptr && (flash_attn || sage_attn)) {
         // LOG_VERBOSE("attention_ext L_q:%d L_k:%d n_head:%d C:%d d_head:%d N:%d", L_q, L_k, n_head, C, d_head, N);

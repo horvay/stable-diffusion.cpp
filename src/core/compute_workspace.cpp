@@ -32,12 +32,25 @@ namespace sd {
         if (!extra_backends_.empty()) {
             return true;
         }
+        bool needs = false;
+        static const bool log_unsupported = getenv("SD_LOG_UNSUPPORTED_OPS") != nullptr;
         for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
-            if (!ggml_backend_supports_op(backend_, ggml_graph_node(graph, i))) {
-                return true;
+            ggml_tensor* node = ggml_graph_node(graph, i);
+            if (!ggml_backend_supports_op(backend_, node)) {
+                if (!log_unsupported) {
+                    return true;
+                }
+                needs = true;
+                LOG_WARN("unsupported on %s: %s %s type=%s src0=%s src1=%s src2=%s ne=[%lld,%lld,%lld,%lld] contiguous=%d",
+                         ggml_backend_name(backend_), ggml_op_desc(node), node->name, ggml_type_name(node->type),
+                         node->src[0] ? ggml_type_name(node->src[0]->type) : "-",
+                         node->src[1] ? ggml_type_name(node->src[1]->type) : "-",
+                         node->src[2] ? ggml_type_name(node->src[2]->type) : "-",
+                         (long long)node->ne[0], (long long)node->ne[1], (long long)node->ne[2], (long long)node->ne[3],
+                         node->src[0] ? (int)ggml_is_contiguous(node->src[0]) : -1);
             }
         }
-        return false;
+        return needs;
     }
 
     ggml_backend_sched_t ComputeWorkspace::make_scheduler(size_t graph_size) {

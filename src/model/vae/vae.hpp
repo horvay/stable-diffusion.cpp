@@ -300,6 +300,18 @@ public:
                                      bool silent       = false) {
         int64_t t0              = ggml_time_ms();
         tiling_params           = resolve_tiling_params(tiling_params);
+        // Decode-only tile override (e.g. SD_VAE_DECODE_TILE=672x768:0.125). Video decode runs in short
+        // temporal windows, so large tiles cut overlap work without the memory cost they have on encode.
+        if (const char* env = getenv("SD_VAE_DECODE_TILE")) {
+            int w = 0, h = 0;
+            float overlap = tiling_params.target_overlap;
+            if (sscanf(env, "%dx%d:%f", &w, &h, &overlap) >= 2 && w > 0 && h > 0) {
+                tiling_params.enabled        = true;
+                tiling_params.tile_size_w    = w;
+                tiling_params.tile_size_h    = h;
+                tiling_params.target_overlap = overlap;
+            }
+        }
         sd::Tensor<float> input = x;
         sd::Tensor<float> output;
 

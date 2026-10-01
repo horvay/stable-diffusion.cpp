@@ -278,6 +278,15 @@ typedef struct {
     sd_audio_t audio;
 } sd_ref_video_t;
 
+// MiniMax-H3 guide anchored at a target pixel frame (ComfyUI MiniMaxH3AddGuide).
+// Either image or audio may be empty (data == NULL). Combines with Ref2VA references.
+typedef struct {
+    sd_image_t image;
+    sd_audio_t audio;
+    int frame_idx;   // negative counts from the end
+    float strength;  // visual_cond_noise_aug; 1.0 pins at t=0.999
+} sd_minimax_guide_t;
+
 typedef struct {
     int* layers;
     size_t layer_count;
@@ -428,13 +437,17 @@ typedef struct {
     const char* negative_prompt;
     int clip_skip;
     sd_image_t init_image;
+    float init_image_strength;
     sd_image_t end_image;
+    float end_image_strength;
     sd_image_t* ref_images;
     int ref_images_count;
     sd_ref_video_t* ref_videos;
     int ref_videos_count;
     sd_audio_t* ref_audios;
     int ref_audios_count;
+    sd_minimax_guide_t* guides;
+    int guides_count;
     sd_image_t* control_frames;
     int control_frames_size;
     int width;

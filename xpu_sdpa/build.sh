@@ -2,6 +2,7 @@
 # Build the Intel XPU helper libraries that sd.cpp dlopens:
 #   libxpu_h3.so   - all MiniMax-H3 transformer blocks on the XPU (SD_XPU_H3_LIB)
 #   libxpu_sdpa.so - attention-only offload (SD_XPU_SDPA_LIB)
+#   (libxpu_qwen21.so, the Qwen Image 2.1 blocks, has SYCL kernels and builds with build_icpx.sh instead)
 #
 # Needs a Python venv with PyTorch for XPU, e.g.:
 #   python -m venv .venv-xpu && .venv-xpu/bin/pip install torch --index-url https://download.pytorch.org/whl/xpu
@@ -14,7 +15,7 @@ TORCH=$("$VENV/bin/python" -c 'import os, torch; print(os.path.dirname(torch.__f
 SITE=$(dirname "$TORCH")
 LIBDIR=$(cd "$SITE/../.." && pwd)  # venv lib/ (libsycl, MKL)
 
-for name in xpu_h3 xpu_sdpa; do
+for name in ${XPU_LIBS:-xpu_h3 xpu_sdpa}; do
   g++ -O2 -std=c++17 -fPIC -shared -pthread -D_GLIBCXX_USE_CXX11_ABI=1 \
     -I"$TORCH/include" -I"$TORCH/include/torch/csrc/api/include" \
     "$HERE/$name.cpp" -o "$HERE/lib$name.so.new" \

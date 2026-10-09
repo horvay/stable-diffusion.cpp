@@ -1,6 +1,8 @@
 #ifndef __SD_MODEL_DIFFUSION_QWEN_IMAGE_2_1_H__
 #define __SD_MODEL_DIFFUSION_QWEN_IMAGE_2_1_H__
 
+#include <dlfcn.h>
+
 #include "model/diffusion/qwen_image.hpp"
 
 namespace Qwen {
@@ -304,8 +306,47 @@ namespace Qwen {
         }
     };
 
+    using XpuQwen21BlocksFn = int (*)(const float*, int64_t, int64_t, const float*, int64_t, const float*,
+                                      const int64_t*, int64_t, int64_t, int64_t, float*, int);
+
+    // SD_XPU_QWEN21_LIB=path/to/libxpu_qwen21.so runs the transformer blocks through libtorch on an Intel XPU.
+    static XpuQwen21BlocksFn xpu_qwen21_blocks_fn() {
+        static const XpuQwen21BlocksFn fn = []() -> XpuQwen21BlocksFn {
+            const char* path = getenv("SD_XPU_QWEN21_LIB");
+            if (path == nullptr || *path == '\0') {
+                return nullptr;
+            }
+            void* lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+            if (lib == nullptr) {
+                LOG_ERROR("SD_XPU_QWEN21_LIB: dlopen failed: %s", dlerror());
+                return nullptr;
+            }
+            auto f = reinterpret_cast<XpuQwen21BlocksFn>(dlsym(lib, "xpu_qwen21_blocks"));
+            if (f == nullptr) {
+                LOG_ERROR("SD_XPU_QWEN21_LIB: xpu_qwen21_blocks not found");
+            } else {
+                LOG_INFO("Qwen Image 2.1 transformer blocks on XPU: %s", path);
+                // first lookup happens while the model is being created: load the XPU weights meanwhile
+                if (auto prefetch = reinterpret_cast<void (*)(int)>(dlsym(lib, "xpu_qwen21_prefetch"))) {
+                    prefetch(getenv("SD_XPU_QWEN21_VERBOSE") != nullptr ? 1 : 0);
+                }
+            }
+            return f;
+        }();
+        return fn;
+    }
+
+    struct XpuQwen21Args {
+        XpuQwen21BlocksFn fn = nullptr;
+        std::vector<int64_t> segments;
+        int64_t prefix_length = 0;
+        int64_t heads         = 0;
+        int64_t head_dim      = 0;
+    };
+
     class QwenImage21Model : public GGMLBlock {
         QwenImage21Config config;
+        XpuQwen21Args xpu_args;
 
     public:
         QwenImage21Model(const QwenImage21Config& config)
@@ -317,7 +358,8 @@ namespace Qwen {
             blocks["norm_out.linear"]                   = std::make_shared<Linear>(config.hidden_size, config.hidden_size, false);
             blocks["norm_out.norm"]                     = std::make_shared<LayerNorm>(config.hidden_size, 1e-6f, false);
             blocks["proj_out"]                          = std::make_shared<Linear>(config.hidden_size, config.out_channels, false);
-            for (int i = 0; i < config.num_layers; ++i) {
+            // With SD_XPU_QWEN21_LIB the blocks run (and keep their weights) on the XPU; skip the Vulkan copy.
+            for (int i = 0; i < config.num_layers && xpu_qwen21_blocks_fn() == nullptr; ++i) {
                 blocks["transformer_blocks." + std::to_string(i)] = std::make_shared<QwenImage21TransformerBlock>(config);
             }
         }
@@ -349,7 +391,41 @@ namespace Qwen {
                 }
             }
             sd::ggml_graph_cut::mark_graph_cut(joint, "qwen_image_2_1.prelude", "joint");
-            for (int i = 0; i < config.num_layers; ++i) {
+            if (auto blocks_fn = xpu_qwen21_blocks_fn()) {
+                // All transformer blocks on an Intel XPU through libtorch (SD_XPU_QWEN21_LIB); see xpu_sdpa/xpu_qwen21.cpp.
+                GGML_ASSERT(cache.mode == QwenImage21PrefixCache::Mode::NONE);
+                xpu_args.fn = blocks_fn;
+                xpu_args.segments.clear();
+                for (const auto& segment : layout.segments) {
+                    xpu_args.segments.insert(xpu_args.segments.end(), {segment.start, segment.end, segment.image_index < 0 ? 1 : 0});
+                }
+                xpu_args.prefix_length = layout.prefix_length;
+                xpu_args.heads         = config.hidden_size / config.head_dim;
+                xpu_args.head_dim      = config.head_dim;
+                ggml_tensor* args[3]   = {ggml_cont(ctx->ggml_ctx, joint),
+                                          ggml_cont(ctx->ggml_ctx, modulation),
+                                          ggml_cont(ctx->ggml_ctx, pe)};
+                auto op = [](ggml_tensor* dst, int ith, int, void* userdata) {
+                    if (ith != 0) {
+                        return;
+                    }
+                    static const bool verbose = getenv("SD_XPU_QWEN21_VERBOSE") != nullptr;
+                    auto* a        = static_cast<XpuQwen21Args*>(userdata);
+                    const auto* hh = dst->src[0];
+                    const auto* mm = dst->src[1];
+                    const auto* pp = dst->src[2];
+                    GGML_ASSERT(mm->ne[0] == 4 * hh->ne[0] && ggml_nrows(mm) == 2 && pp->ne[3] == hh->ne[1]);
+                    int rc = a->fn(static_cast<const float*>(hh->data), ggml_nrows(hh), hh->ne[0],
+                                   static_cast<const float*>(mm->data), a->prefix_length,
+                                   static_cast<const float*>(pp->data),
+                                   a->segments.data(), static_cast<int64_t>(a->segments.size() / 3),
+                                   a->heads, a->head_dim, static_cast<float*>(dst->data), verbose ? 1 : 0);
+                    GGML_ASSERT(rc == 0 && "xpu_qwen21_blocks failed");
+                };
+                joint = ggml_custom_4d(ctx->ggml_ctx, GGML_TYPE_F32, joint->ne[0], joint->ne[1], joint->ne[2], joint->ne[3],
+                                       args, 3, op, 1, &xpu_args);
+            }
+            for (int i = 0; i < config.num_layers && xpu_qwen21_blocks_fn() == nullptr; ++i) {
                 const std::string layer = "transformer_blocks." + std::to_string(i);
                 auto layer_cache        = cache;
                 layer_cache.name        = cache.name + "." + std::to_string(i);
@@ -485,7 +561,9 @@ namespace Qwen {
                 prefix_cache_auto_f32 = false;
             }
             QwenImage21PrefixCache cache;
-            if (prefix_cache_enabled && !prefix_cache_disabled && extra != nullptr && extra->prefix_id != 0 && layout.prefix_length > 0) {
+            // The XPU path recomputes the short text prefix each call instead of caching its K/V.
+            const bool xpu_blocks = xpu_qwen21_blocks_fn() != nullptr;
+            if (!xpu_blocks && prefix_cache_enabled && !prefix_cache_disabled && extra != nullptr && extra->prefix_id != 0 && layout.prefix_length > 0) {
                 cache.name = "qwen_image_2_1.prefix." + std::to_string(extra->prefix_id) +
                              ".circular." + std::to_string(circular_x_enabled) + std::to_string(circular_y_enabled);
                 cache.prefix_length = layout.prefix_length;
@@ -519,7 +597,7 @@ namespace Qwen {
                 embedding.values = Rope::embed_nd(embedding.ids, 1, 10000.f, config.axes_dim, embedding.layout, &embedding.frequencies);
                 pe_data          = finish_rope_pe(std::move(embedding));
                 mask_data.clear();
-                if (!cached) {
+                if (!cached && !xpu_blocks) {
                     for (const auto& segment : layout.segments) {
                         sd::Tensor<float> mask;
                         if (segment.image_index < 0) {

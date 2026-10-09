@@ -28,6 +28,7 @@
 #include <cstring>
 #include <exception>
 #include <fstream>
+#include <sstream>
 #include <map>
 #include <regex>
 #include <stdexcept>
@@ -49,6 +50,7 @@ struct Linear {
     at::Tensor q;  // int8 [out, in] (rotated)
     at::Tensor s;  // f32  [out, 1]
     int64_t group = 256;
+    at::Tensor la, lb;  // optional LoRA: bf16 [r, in] and [out, r] (strength folded into lb)
 };
 
 struct Block {
@@ -152,6 +154,69 @@ at::Tensor hadamard(int64_t n) {
     return h.to(kXpu).to(at::kBFloat16);
 }
 
+// SD_XPU_H3_LORA="a.safetensors[@strength],b.safetensors[@strength]": PEFT/ai-toolkit LoRAs on the block
+// linears (diffusion_model.blocks.N.{attn.qkv_proj,attn.out_proj,mlp.fc1,mlp.fc2}.lora_{A,B}.weight).
+// Applied as a low-rank side path on the unrotated input; several LoRAs are concatenated along the rank.
+void load_loras(int verbose) {
+    const char* spec = std::getenv("SD_XPU_H3_LORA");
+    if (spec == nullptr || *spec == '\0') {
+        return;
+    }
+    std::stringstream list(spec);
+    std::string item;
+    while (std::getline(list, item, ',')) {
+        float strength = 1.f;
+        const size_t at = item.rfind('@');
+        if (at != std::string::npos) {
+            strength = std::stof(item.substr(at + 1));
+            item     = item.substr(0, at);
+        }
+        std::ifstream f(item, std::ios::binary);
+        if (!f) {
+            throw std::runtime_error("cannot open LoRA " + item);
+        }
+        uint64_t base = 0;
+        auto index    = read_header(f, &base);
+        int applied   = 0;
+        for (size_t i = 0; i < g_blocks.size(); ++i) {
+            const std::pair<const char*, Linear*> targets[] = {{"attn.qkv_proj", &g_blocks[i].qkv},
+                                                                {"attn.out_proj", &g_blocks[i].out},
+                                                                {"mlp.fc1", &g_blocks[i].fc1},
+                                                                {"mlp.fc2", &g_blocks[i].fc2}};
+            for (const auto& [name, lin] : targets) {
+                std::string key;
+                for (const char* prefix : {"diffusion_model.", "transformer.", "model.diffusion_model.", ""}) {
+                    std::string k = std::string(prefix) + "blocks." + std::to_string(i) + "." + name;
+                    if (index.count(k + ".lora_A.weight")) {
+                        key = k;
+                        break;
+                    }
+                }
+                if (key.empty()) {
+                    continue;
+                }
+                auto a      = load_tensor(f, base, index, key + ".lora_A.weight", at::kFloat);
+                auto b      = load_tensor(f, base, index, key + ".lora_B.weight", at::kFloat);
+                float scale = strength;
+                if (index.count(key + ".alpha")) {
+                    scale *= load_tensor(f, base, index, key + ".alpha", at::kFloat).item<float>() / static_cast<float>(a.size(0));
+                }
+                a = a.to(at::kBFloat16);
+                b = (b * scale).to(at::kBFloat16);
+                lin->la = lin->la.defined() ? at::cat({lin->la, a}, 0) : a;
+                lin->lb = lin->lb.defined() ? at::cat({lin->lb, b}, 1) : b;
+                ++applied;
+            }
+        }
+        if (verbose) {
+            std::fprintf(stderr, "[xpu_h3] LoRA %s @ %.2f on %d linears\n", item.c_str(), strength, applied);
+        }
+        if (applied == 0) {
+            throw std::runtime_error("LoRA " + item + " matched no block linears");
+        }
+    }
+}
+
 void load_weights(const char* path, int verbose) {
     const auto t0 = std::chrono::steady_clock::now();
     std::ifstream f(path, std::ios::binary);
@@ -183,6 +248,7 @@ void load_weights(const char* path, int verbose) {
         b.ada_b             = load_tensor(f, base, index, p + "adaln_proj.linear.bias", at::kFloat);
     }
     g_hadamard = hadamard(256);
+    load_loras(verbose);
     // drop the load-time conversion scratch so Vulkan sees it as free
     c10::getDeviceAllocator(c10::DeviceType::XPU)->emptyCache();
     g_loaded = true;
@@ -201,7 +267,11 @@ at::Tensor linear(const at::Tensor& x, const Linear& l) {
     }
     auto q = l.q.is_cpu() ? l.q.to(kXpu, /*non_blocking=*/true) : l.q;
     auto w = (q.to(at::kFloat) * l.s).to(at::kBFloat16);
-    return at::matmul(xr, w.t());
+    auto y = at::matmul(xr, w.t());
+    if (l.la.defined()) {
+        y.add_(at::matmul(at::matmul(x, l.la.t()), l.lb.t()));
+    }
+    return y;
 }
 
 at::Tensor rms_norm(const at::Tensor& x, const at::Tensor& w, double eps) {

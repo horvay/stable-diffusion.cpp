@@ -3,7 +3,7 @@
 # SYCL runtime (torch 2.11+xpu ships libsycl.so.8 = DPC++ 2025.3.2).
 #   ONEAPI=~/opt/oneapi-2025.3/opt/intel/oneapi   DPC++ 2025.3.2 unpacked from Intel's APT packages
 #   ONEDNN=~/opt/onednn-sycl                      oneDNN built with ONEDNN_GPU_RUNTIME=SYCL
-# Usage: TORCH_VENV=/path/to/.venv-xpu ./build_icpx.sh [src.cpp ...]   (default: xpu_qwen21.cpp)
+# Usage: TORCH_VENV=/path/to/.venv-xpu ./build_icpx.sh [src.cpp ...]   (default: xpu_qwen21.cpp xpu_h3.cpp)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -16,7 +16,7 @@ LIBDIR=$(cd "$(dirname "$TORCH")/../.." && pwd)
 export PATH=$CMPLR/bin:$PATH LD_LIBRARY_PATH=$CMPLR/lib:$ONEAPI/umf/1.0/lib:$ONEAPI/tcm/1.4/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 
 srcs=("$@")
-[[ ${#srcs[@]} -gt 0 ]] || srcs=("$HERE/xpu_qwen21.cpp")
+[[ ${#srcs[@]} -gt 0 ]] || srcs=("$HERE/xpu_qwen21.cpp" "$HERE/xpu_h3.cpp")
 for src in "${srcs[@]}"; do
   name=$(basename "${src%.cpp}")
   out="$(dirname "$src")/lib$name.so"

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <dlfcn.h>
 #include <memory>
 #include <string>
 #include <tuple>
@@ -17,6 +18,32 @@
 namespace MiniMaxH3VAE {
 
     constexpr int H3_VIDEO_VAE_GRAPH_SIZE = 262144;
+
+    // SD_XPU_H3VAE_LIB=path/to/libxpu_h3vae.so decodes every tile through libtorch on an Intel XPU
+    // (xpu_sdpa/xpu_h3vae.cpp) instead of the Vulkan graph below; tiling and temporal windows are unchanged.
+    using XpuH3VaeDecodeFn = int (*)(const float*, int64_t, int64_t, int64_t, int64_t, const float*, int64_t, int64_t,
+                                     float*, int);
+    static XpuH3VaeDecodeFn xpu_h3vae_decode_fn() {
+        static const XpuH3VaeDecodeFn fn = []() -> XpuH3VaeDecodeFn {
+            const char* path = getenv("SD_XPU_H3VAE_LIB");
+            if (path == nullptr || *path == '\0') {
+                return nullptr;
+            }
+            void* lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+            if (lib == nullptr) {
+                LOG_ERROR("SD_XPU_H3VAE_LIB: dlopen failed: %s", dlerror());
+                return nullptr;
+            }
+            auto f = reinterpret_cast<XpuH3VaeDecodeFn>(dlsym(lib, "xpu_h3vae_decode"));
+            if (f == nullptr) {
+                LOG_ERROR("SD_XPU_H3VAE_LIB: xpu_h3vae_decode not found");
+            } else {
+                LOG_INFO("MiniMax-H3 video VAE decoder on XPU: %s", path);
+            }
+            return f;
+        }();
+        return fn;
+    }
 
     struct CausalConv3d : public Conv3d {
         std::tuple<int, int, int> temporal_padding;
@@ -778,6 +805,25 @@ namespace MiniMaxH3VAE {
                 rope_cache = build_rope(input.shape()[0],
                                         input.shape()[1],
                                         input.shape()[2]);
+                if (auto xpu_decode = xpu_h3vae_decode_fn(); xpu_decode != nullptr && input.shape()[4] == 1) {
+                    static const bool verbose = getenv("SD_XPU_H3VAE_VERBOSE") != nullptr;
+                    const int64_t W           = input.shape()[0];
+                    const int64_t H           = input.shape()[1];
+                    const int64_t T           = input.shape()[2];
+                    const int64_t C           = input.shape()[3];
+                    sd::Tensor<float> pixels({W * Decoder::patch_size,
+                                              H * Decoder::patch_size,
+                                              T * Decoder::patch_size_t,
+                                              3,
+                                              1});
+                    int rc = xpu_decode(input.data(), W, H, T, C,
+                                        rope_cache.data(), rope_cache.shape()[3], rope_cache.shape()[2],
+                                        pixels.data(), verbose ? 1 : 0);
+                    if (rc == 0) {
+                        return pixels;
+                    }
+                    LOG_WARN("XPU VAE decode failed; decoding this tile on %s", ggml_backend_name(runtime_backend));
+                }
             }
             auto get_graph = [&]() -> ggml_cgraph* {
                 auto value       = make_input(input);

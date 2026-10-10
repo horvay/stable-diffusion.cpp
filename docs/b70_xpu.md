@@ -50,6 +50,18 @@ after it, so both runtimes can share the 32 GB.
 - Without `SD_XPU_H3_LIB`, `SD_VK_XE_FA=1` + `GGML_VK_MAX_NODES_PER_SUBMIT=4` give the best
   pure-Vulkan path; `SD_XPU_SDPA_LIB` offloads attention only.
 
+## H3 speed-ups (all opt-in)
+
+| Switch | What it does |
+| --- | --- |
+| `SD_XPU_H3VAE_LIB=xpu_sdpa/libxpu_h3vae.so` + `SD_XPU_H3VAE_WEIGHTS=<video VAE .safetensors>` | Each 256 px decode tile (post_quant_conv, 36 decoder blocks, norm_out, proj_out, unpatchify) runs through libtorch on the XPU instead of the Vulkan graph. Tiling, temporal windows and blending are unchanged. Weights load on the first tile and stay resident across tiles and windows (no per-window restaging). |
+| `SD_XPU_H3VAE_DTYPE=bf16` (default) / `fp16` / `f32` | dtype of the decoder linears and attention; residual stream, norms and proj_out stay f32. CPU reference check on a small tile: bf16 60 dB, fp16 78 dB PSNR against f32. |
+| `sd-cli --multi-jobs FILE` | Several vid_gen jobs in one process: FILE has one JSON array of extra arguments per line (prompt, refs, guides, frames, seed, `-o`), appended to the command line. MiniMax-H3 prepares every job's reference latents and conditioning first, frees the text encoder (staged and host copies), then samples and decodes the jobs in order. Each job writes the same files a single run would. With `SD_XPU_H3VAE_LIB` the block weights also stay on the XPU between jobs (`SD_MULTI_KEEP_XPU_BLOCKS=0/1` overrides) and the VAE weights park in pinned host memory while sampling. |
+| `SD_XPU_H3_INT8=1` (libxpu_h3.so from `build_icpx.sh`) | W8A8 transformer blocks like libxpu_qwen21: the checkpoint's int8 convrot weights as stored, oneDNN s8 GEMMs with fused scales, rotate+quantize fused into the RMSNorm/modulation, attention-output and SwiGLU kernels (`xpu_h3_kernels.hpp`). `SD_XPU_H3_LORA` stays exact for the base weights: A R is quantized per row and appended to the weight as extra output rows, and the bf16 (x A^T) B^T term is added after the GEMM. `SD_XPU_H3_INT8_UNFUSED=1` uses torch rotate + a quantize kernel instead of the fused kernels. Changes outputs slightly (activation quantization). |
+
+Build: `TORCH_VENV=... xpu_sdpa/build.sh` (libxpu_h3vae, libxpu_sdpa) and `TORCH_VENV=... xpu_sdpa/build_icpx.sh`
+(libxpu_qwen21, libxpu_h3; libxpu_h3 now needs icpx because of the int8 kernels).
+
 # Qwen Image 2.1 on Intel Arc Pro B70 (XPU blocks)
 
 `SD_XPU_QWEN21_LIB=xpu_sdpa/libxpu_qwen21.so` runs all 32 Qwen Image 2.1 transformer blocks on the XPU;

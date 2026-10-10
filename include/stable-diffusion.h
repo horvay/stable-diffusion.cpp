@@ -556,6 +556,23 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
                            sd_audio_t** audio_out,
                            int* fps_out);
 
+// Multi-job video generation in one context (MiniMax-H3): every job's conditioning is encoded first, the text
+// encoder is freed, then the jobs are sampled and decoded in order with the diffusion weights kept loaded.
+// Each job's result matches a generate_video() call with the same parameters. result_cb runs once per job, in
+// order, as soon as that job is done (frames == NULL on failure) and takes ownership of frames (free_sd_images)
+// and audio (free_sd_audio). Other model families run the jobs one at a time. Returns the number of successes.
+typedef void (*sd_video_result_cb_t)(int index,
+                                     sd_image_t* frames,
+                                     int num_frames,
+                                     sd_audio_t* audio,
+                                     int fps,
+                                     void* data);
+SD_API int generate_videos(sd_ctx_t* sd_ctx,
+                           const sd_vid_gen_params_t* const* params,
+                           int count,
+                           sd_video_result_cb_t result_cb,
+                           void* data);
+
 typedef struct upscaler_ctx_t upscaler_ctx_t;
 
 SD_API upscaler_ctx_t* new_upscaler_ctx(const char* esrgan_path,

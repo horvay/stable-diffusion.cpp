@@ -366,6 +366,11 @@ public:
 
     SDCondition get_learned_condition(const ConditionerParams& params);
 
+    // Free the text encoder for the rest of this context: its staged device copy, its params storage (host or
+    // pinned host memory) and the runner itself. Used by the multi-job video path once every job's conditioning
+    // is encoded; the conditioner cannot be used again in this context afterwards.
+    bool release_conditioner();
+
     void reset_generation_extensions();
 
     void prepare_generation_extensions(const sd_pm_params_t& pm_params,

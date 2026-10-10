@@ -4,9 +4,11 @@
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <random>
 #include <regex>
 #include <sstream>
@@ -20,6 +22,7 @@
 #include "common/media_io.h"
 #include "common/resource_owners.hpp"
 #include "image_metadata.h"
+#include "json.hpp"
 
 namespace fs = std::filesystem;
 
@@ -56,6 +59,7 @@ struct SDCliParams {
 
     std::string imatrix_out;
     std::vector<std::string> imatrix_in;
+    std::string multi_jobs_path;
 
     bool normal_exit = false;
 
@@ -88,6 +92,14 @@ struct SDCliParams {
              "compute the imatrix for this run and save it to the provided path",
              0,
              &imatrix_out},
+            {"",
+             "--multi-jobs",
+             "vid_gen: render several jobs in one process. FILE has one job per line, a JSON array of extra arguments "
+             "for that job (e.g. [\"-p\", \"...\", \"-r\", \"a.png\", \"--seed\", \"1\", \"-o\", \"out/raw.mp4\"]), appended to "
+             "this command line. MiniMax-H3 encodes every job's conditioning first, frees the text encoder, then "
+             "samples and decodes the jobs with the diffusion weights kept loaded",
+             0,
+             &multi_jobs_path},
         };
 
         options.int_options = {
@@ -636,6 +648,327 @@ static bool apply_adetailer(sd_ctx_t* sd_ctx,
     return true;
 }
 
+// Load every image / audio / frame-directory input named in gen_params (main and the --multi-jobs path).
+static bool load_generation_inputs(SDMode mode, SDGenerationParams& gen_params) {
+    auto load_image_and_update_size = [&](const std::string& path,
+                                          SDImageOwner& image,
+                                          int expected_channel = 3) -> bool {
+        if (!load_sd_image_from_file(image.put(), path.c_str(), 0, 0, expected_channel)) {
+            LOG_ERROR("load image from '%s' failed", path.c_str());
+            return false;
+        }
+
+        gen_params.set_width_and_height_if_unset(image.get().width, image.get().height);
+        return true;
+    };
+
+    auto load_audio = [&](const std::string& path, SDAudioOwner& audio) -> bool {
+        std::vector<float> samples;
+        uint32_t sample_rate = 0;
+        uint32_t channels    = 0;
+        if (!load_wav_from_file(path, samples, sample_rate, channels)) {
+            LOG_ERROR("load WAV audio from '%s' failed", path.c_str());
+            return false;
+        }
+        audio.reset(std::move(samples), sample_rate, channels);
+        return true;
+    };
+
+    if (gen_params.init_image_path.size() > 0) {
+        const bool native_init = mode == IMG_GEN || mode == ADETAILER;
+        if (!load_image_and_update_size(gen_params.init_image_path, gen_params.init_image, native_init ? 0 : 3)) {
+            return false;
+        }
+    }
+
+    if (gen_params.end_image_path.size() > 0) {
+        if (!load_image_and_update_size(gen_params.end_image_path, gen_params.end_image)) {
+            return false;
+        }
+    }
+
+    if (gen_params.ref_image_paths.size() > 0) {
+        gen_params.ref_images.clear();
+        for (auto& path : gen_params.ref_image_paths) {
+            SDImageOwner ref_image({0, 0, 0, nullptr});
+            if (!load_image_and_update_size(path, ref_image, 0)) {
+                return false;
+            }
+            gen_params.ref_images.push_back(std::move(ref_image));
+        }
+    }
+
+    if (!gen_params.ref_video_paths.empty()) {
+        gen_params.ref_videos.clear();
+        gen_params.ref_videos.reserve(gen_params.ref_video_paths.size());
+        for (const auto& path : gen_params.ref_video_paths) {
+            std::vector<SDImageOwner> frames;
+            if (!load_images_from_dir(path, frames) || frames.empty()) {
+                LOG_ERROR("load reference video frames from '%s' failed", path.c_str());
+                return false;
+            }
+            gen_params.ref_videos.push_back(std::move(frames));
+        }
+
+        gen_params.ref_video_audios.clear();
+        gen_params.ref_video_audios.resize(gen_params.ref_videos.size());
+        for (size_t i = 0; i < gen_params.ref_video_audio_paths.size(); ++i) {
+            if (!load_audio(gen_params.ref_video_audio_paths[i], gen_params.ref_video_audios[i])) {
+                return false;
+            }
+        }
+    }
+
+    if (!gen_params.ref_audio_paths.empty()) {
+        gen_params.ref_audios.clear();
+        gen_params.ref_audios.resize(gen_params.ref_audio_paths.size());
+        for (size_t i = 0; i < gen_params.ref_audio_paths.size(); ++i) {
+            if (!load_audio(gen_params.ref_audio_paths[i], gen_params.ref_audios[i])) {
+                return false;
+            }
+        }
+    }
+
+    auto split_spec = [](const std::string& spec, std::string& path, int& frame, float& strength) -> bool {
+        std::vector<std::string> parts;
+        size_t at = spec.find('@');
+        path      = spec.substr(0, at);
+        while (at != std::string::npos) {
+            size_t start = at + 1;
+            at           = spec.find('@', start);
+            parts.push_back(spec.substr(start, at == std::string::npos ? std::string::npos : at - start));
+        }
+        if (path.empty() || parts.empty() || parts.size() > 2) {
+            return false;
+        }
+        try {
+            frame    = std::stoi(parts[0]);
+            strength = parts.size() > 1 ? std::stof(parts[1]) : 1.f;
+        } catch (...) {
+            return false;
+        }
+        return true;
+    };
+
+    gen_params.guide_images.clear();
+    gen_params.guide_frame_idxs.clear();
+    gen_params.guide_strengths.clear();
+    for (const auto& spec : gen_params.guide_specs) {
+        std::string path;
+        int frame      = 0;
+        float strength = 1.f;
+        if (!split_spec(spec, path, frame, strength)) {
+            LOG_ERROR("invalid --guide '%s', expected PATH@FRAME[@STRENGTH]", spec.c_str());
+            return false;
+        }
+        SDImageOwner image({0, 0, 0, nullptr});
+        if (!load_image_and_update_size(path, image)) {
+            return false;
+        }
+        gen_params.guide_images.push_back(std::move(image));
+        gen_params.guide_frame_idxs.push_back(frame);
+        gen_params.guide_strengths.push_back(strength);
+    }
+
+    gen_params.guide_audios.clear();
+    gen_params.guide_audio_frame_idxs.clear();
+    gen_params.guide_audios.resize(gen_params.guide_audio_specs.size());
+    for (size_t i = 0; i < gen_params.guide_audio_specs.size(); ++i) {
+        std::string path;
+        int frame      = 0;
+        float strength = 1.f;
+        if (!split_spec(gen_params.guide_audio_specs[i], path, frame, strength) ||
+            !load_audio(path, gen_params.guide_audios[i])) {
+            LOG_ERROR("invalid --guide-audio '%s', expected PATH@FRAME", gen_params.guide_audio_specs[i].c_str());
+            return false;
+        }
+        gen_params.guide_audio_frame_idxs.push_back(frame);
+    }
+
+    if (gen_params.mask_image_path.size() > 0) {
+        if (!load_sd_image_from_file(gen_params.mask_image.put(),
+                                     gen_params.mask_image_path.c_str(),
+                                     0,
+                                     0,
+                                     1)) {
+            LOG_ERROR("load image from '%s' failed", gen_params.mask_image_path.c_str());
+            return false;
+        }
+    }
+
+    if (gen_params.control_image_path.size() > 0) {
+        if (!load_sd_image_from_file(gen_params.control_image.put(),
+                                     gen_params.control_image_path.c_str(),
+                                     0,
+                                     0)) {
+            LOG_ERROR("load image from '%s' failed", gen_params.control_image_path.c_str());
+            return false;
+        }
+    }
+
+    if (gen_params.ip_adapter_image_path.size() > 0) {
+        if (!load_sd_image_from_file(gen_params.ip_adapter_image.put(),
+                                     gen_params.ip_adapter_image_path.c_str(),
+                                     0,
+                                     0)) {
+            LOG_ERROR("load image from '%s' failed", gen_params.ip_adapter_image_path.c_str());
+            return false;
+        }
+    }
+
+    if (!gen_params.control_video_path.empty()) {
+        gen_params.control_frames.clear();
+        if (!load_images_from_dir(gen_params.control_video_path,
+                                  gen_params.control_frames,
+                                  gen_params.video_frames)) {
+            return false;
+        }
+    }
+
+    if (!gen_params.pm_id_images_dir.empty()) {
+        gen_params.pm_id_images.clear();
+        if (!load_images_from_dir(gen_params.pm_id_images_dir,
+                                  gen_params.pm_id_images)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// --multi-jobs FILE: each line is a JSON array of extra arguments for one job, parsed together with this command
+// line exactly as a separate sd-cli run would parse them; all jobs then run through generate_videos().
+struct MultiJob {
+    SDCliParams cli;
+    SDContextParams ctx;
+    SDGenerationParams gen;
+    sd_vid_gen_params_t vid{};
+};
+
+struct MultiJobState {
+    std::vector<std::unique_ptr<MultiJob>>* jobs = nullptr;
+    int saved                                    = 0;
+};
+
+static void multi_job_result(int index, sd_image_t* frames, int num_frames, sd_audio_t* audio, int fps, void* data) {
+    auto* state   = static_cast<MultiJobState*>(data);
+    MultiJob& job = *(*state->jobs)[static_cast<size_t>(index)];
+    if (frames == nullptr || num_frames <= 0) {
+        LOG_ERROR("[multi] job %d (%s): generation failed", index + 1, job.cli.output_path.c_str());
+        free_sd_audio(audio);
+        return;
+    }
+    if (fps > 0) {
+        job.gen.fps = fps;
+    }
+    if (save_results(job.cli, job.ctx, job.gen, frames, num_frames, audio)) {
+        ++state->saved;
+        LOG_INFO("[multi] job %d: saved %s", index + 1, job.cli.output_path.c_str());
+    } else {
+        LOG_ERROR("[multi] job %d: saving %s failed", index + 1, job.cli.output_path.c_str());
+    }
+    free_sd_images(frames, num_frames);
+    free_sd_audio(audio);
+}
+
+static int run_multi_jobs(int argc, const char* argv[], const SDCliParams& base_cli, SDContextParams& base_ctx) {
+    if (base_cli.mode != VID_GEN) {
+        LOG_ERROR("--multi-jobs needs -M vid_gen");
+        return 1;
+    }
+    std::vector<std::string> base_args;
+    for (int i = 0; i < argc; ++i) {
+        if (std::string(argv[i]) == "--multi-jobs") {
+            ++i;  // and its value
+            continue;
+        }
+        base_args.push_back(argv[i]);
+    }
+    std::ifstream file(base_cli.multi_jobs_path);
+    if (!file) {
+        LOG_ERROR("cannot open --multi-jobs file '%s'", base_cli.multi_jobs_path.c_str());
+        return 1;
+    }
+    std::vector<std::unique_ptr<MultiJob>> jobs;
+    std::string line;
+    int line_no = 0;
+    while (std::getline(file, line)) {
+        ++line_no;
+        const size_t first = line.find_first_not_of(" \t\r");
+        if (first == std::string::npos || line[first] == '#') {
+            continue;
+        }
+        std::vector<std::string> args = base_args;
+        try {
+            auto parsed = nlohmann::json::parse(line);
+            if (!parsed.is_array()) {
+                throw std::runtime_error("not a JSON array");
+            }
+            for (const auto& item : parsed) {
+                args.push_back(item.get<std::string>());
+            }
+        } catch (const std::exception& e) {
+            LOG_ERROR("--multi-jobs line %d: %s", line_no, e.what());
+            return 1;
+        }
+        std::vector<const char*> job_argv;
+        for (const auto& a : args) {
+            job_argv.push_back(a.c_str());
+        }
+        auto job = std::make_unique<MultiJob>();
+        std::vector<ArgOptions> options = {job->cli.get_options(), job->ctx.get_options(), job->gen.get_options()};
+        if (!parse_options(static_cast<int>(job_argv.size()), job_argv.data(), options) ||
+            !job->cli.resolve_and_validate() ||
+            !job->ctx.resolve_and_validate(job->cli.mode) ||
+            !job->gen.resolve_and_validate(job->cli.mode, job->ctx.lora_model_dir, job->ctx.hires_upscalers_dir)) {
+            LOG_ERROR("--multi-jobs line %d: invalid arguments", line_no);
+            return 1;
+        }
+        if (!job->cli.multi_jobs_path.empty() || job->cli.mode != VID_GEN) {
+            LOG_ERROR("--multi-jobs line %d: jobs cannot change the mode or nest --multi-jobs", line_no);
+            return 1;
+        }
+        if (!load_generation_inputs(job->cli.mode, job->gen)) {
+            LOG_ERROR("--multi-jobs line %d: loading the inputs failed", line_no);
+            return 1;
+        }
+        LOG_INFO("[multi] queued #%zu: %s (%d frames, seed %lld)", jobs.size() + 1, job->cli.output_path.c_str(),
+                 job->gen.video_frames, (long long)job->gen.seed);
+        jobs.push_back(std::move(job));
+    }
+    if (jobs.empty()) {
+        LOG_ERROR("--multi-jobs file '%s' has no jobs", base_cli.multi_jobs_path.c_str());
+        return 1;
+    }
+
+    sd_ctx_params_t sd_ctx_params = base_ctx.to_sd_ctx_params_t(base_cli.taesd_preview);
+    SDCtxPtr sd_ctx(new_sd_ctx(&sd_ctx_params));
+    if (sd_ctx == nullptr) {
+        LOG_INFO("new_sd_ctx_t failed");
+        return 1;
+    }
+    std::vector<const sd_vid_gen_params_t*> params;
+    for (auto& job : jobs) {
+        SDGenerationParams& gen = job->gen;
+        if (gen.sample_params.sample_method == SAMPLE_METHOD_COUNT) {
+            gen.sample_params.sample_method = sd_get_default_sample_method(sd_ctx.get());
+        }
+        if (gen.high_noise_sample_params.sample_method == SAMPLE_METHOD_COUNT) {
+            gen.high_noise_sample_params.sample_method = sd_get_default_sample_method(sd_ctx.get());
+        }
+        if (gen.sample_params.scheduler == SCHEDULER_COUNT) {
+            gen.sample_params.scheduler = sd_get_default_scheduler(sd_ctx.get(), gen.sample_params.sample_method);
+        }
+        job->vid = gen.to_sd_vid_gen_params_t();
+        params.push_back(&job->vid);
+    }
+    MultiJobState state;
+    state.jobs = &jobs;
+    generate_videos(sd_ctx.get(), params.data(), static_cast<int>(params.size()), multi_job_result, &state);
+    LOG_INFO("[multi] %d/%zu jobs saved", state.saved, jobs.size());
+    return state.saved == static_cast<int>(jobs.size()) ? 0 : 1;
+}
+
 int main(int argc, const char* argv[]) {
     if (argc > 1 && std::string(argv[1]) == "--version") {
         std::cout << version_string() << "\n";
@@ -715,6 +1048,10 @@ int main(int argc, const char* argv[]) {
         }
     }
 
+    if (!cli_params.multi_jobs_path.empty()) {
+        return run_multi_jobs(argc, argv, cli_params, ctx_params);
+    }
+
     if (cli_params.mode == CONVERT) {
         bool success = convert_with_components(ctx_params.model_path.c_str(),
                                                ctx_params.clip_l_path.c_str(),
@@ -742,187 +1079,8 @@ int main(int argc, const char* argv[]) {
         }
     }
 
-    auto load_image_and_update_size = [&](const std::string& path,
-                                          SDImageOwner& image,
-                                          int expected_channel = 3) -> bool {
-        if (!load_sd_image_from_file(image.put(), path.c_str(), 0, 0, expected_channel)) {
-            LOG_ERROR("load image from '%s' failed", path.c_str());
-            return false;
-        }
-
-        gen_params.set_width_and_height_if_unset(image.get().width, image.get().height);
-        return true;
-    };
-
-    auto load_audio = [&](const std::string& path, SDAudioOwner& audio) -> bool {
-        std::vector<float> samples;
-        uint32_t sample_rate = 0;
-        uint32_t channels    = 0;
-        if (!load_wav_from_file(path, samples, sample_rate, channels)) {
-            LOG_ERROR("load WAV audio from '%s' failed", path.c_str());
-            return false;
-        }
-        audio.reset(std::move(samples), sample_rate, channels);
-        return true;
-    };
-
-    if (gen_params.init_image_path.size() > 0) {
-        const bool native_init = cli_params.mode == IMG_GEN || cli_params.mode == ADETAILER;
-        if (!load_image_and_update_size(gen_params.init_image_path, gen_params.init_image, native_init ? 0 : 3)) {
-            return 1;
-        }
-    }
-
-    if (gen_params.end_image_path.size() > 0) {
-        if (!load_image_and_update_size(gen_params.end_image_path, gen_params.end_image)) {
-            return 1;
-        }
-    }
-
-    if (gen_params.ref_image_paths.size() > 0) {
-        gen_params.ref_images.clear();
-        for (auto& path : gen_params.ref_image_paths) {
-            SDImageOwner ref_image({0, 0, 0, nullptr});
-            if (!load_image_and_update_size(path, ref_image, 0)) {
-                return 1;
-            }
-            gen_params.ref_images.push_back(std::move(ref_image));
-        }
-    }
-
-    if (!gen_params.ref_video_paths.empty()) {
-        gen_params.ref_videos.clear();
-        gen_params.ref_videos.reserve(gen_params.ref_video_paths.size());
-        for (const auto& path : gen_params.ref_video_paths) {
-            std::vector<SDImageOwner> frames;
-            if (!load_images_from_dir(path, frames) || frames.empty()) {
-                LOG_ERROR("load reference video frames from '%s' failed", path.c_str());
-                return 1;
-            }
-            gen_params.ref_videos.push_back(std::move(frames));
-        }
-
-        gen_params.ref_video_audios.clear();
-        gen_params.ref_video_audios.resize(gen_params.ref_videos.size());
-        for (size_t i = 0; i < gen_params.ref_video_audio_paths.size(); ++i) {
-            if (!load_audio(gen_params.ref_video_audio_paths[i], gen_params.ref_video_audios[i])) {
-                return 1;
-            }
-        }
-    }
-
-    if (!gen_params.ref_audio_paths.empty()) {
-        gen_params.ref_audios.clear();
-        gen_params.ref_audios.resize(gen_params.ref_audio_paths.size());
-        for (size_t i = 0; i < gen_params.ref_audio_paths.size(); ++i) {
-            if (!load_audio(gen_params.ref_audio_paths[i], gen_params.ref_audios[i])) {
-                return 1;
-            }
-        }
-    }
-
-    auto split_spec = [](const std::string& spec, std::string& path, int& frame, float& strength) -> bool {
-        std::vector<std::string> parts;
-        size_t at = spec.find('@');
-        path      = spec.substr(0, at);
-        while (at != std::string::npos) {
-            size_t start = at + 1;
-            at           = spec.find('@', start);
-            parts.push_back(spec.substr(start, at == std::string::npos ? std::string::npos : at - start));
-        }
-        if (path.empty() || parts.empty() || parts.size() > 2) {
-            return false;
-        }
-        try {
-            frame    = std::stoi(parts[0]);
-            strength = parts.size() > 1 ? std::stof(parts[1]) : 1.f;
-        } catch (...) {
-            return false;
-        }
-        return true;
-    };
-
-    gen_params.guide_images.clear();
-    gen_params.guide_frame_idxs.clear();
-    gen_params.guide_strengths.clear();
-    for (const auto& spec : gen_params.guide_specs) {
-        std::string path;
-        int frame      = 0;
-        float strength = 1.f;
-        if (!split_spec(spec, path, frame, strength)) {
-            LOG_ERROR("invalid --guide '%s', expected PATH@FRAME[@STRENGTH]", spec.c_str());
-            return 1;
-        }
-        SDImageOwner image({0, 0, 0, nullptr});
-        if (!load_image_and_update_size(path, image)) {
-            return 1;
-        }
-        gen_params.guide_images.push_back(std::move(image));
-        gen_params.guide_frame_idxs.push_back(frame);
-        gen_params.guide_strengths.push_back(strength);
-    }
-
-    gen_params.guide_audios.clear();
-    gen_params.guide_audio_frame_idxs.clear();
-    gen_params.guide_audios.resize(gen_params.guide_audio_specs.size());
-    for (size_t i = 0; i < gen_params.guide_audio_specs.size(); ++i) {
-        std::string path;
-        int frame      = 0;
-        float strength = 1.f;
-        if (!split_spec(gen_params.guide_audio_specs[i], path, frame, strength) ||
-            !load_audio(path, gen_params.guide_audios[i])) {
-            LOG_ERROR("invalid --guide-audio '%s', expected PATH@FRAME", gen_params.guide_audio_specs[i].c_str());
-            return 1;
-        }
-        gen_params.guide_audio_frame_idxs.push_back(frame);
-    }
-
-    if (gen_params.mask_image_path.size() > 0) {
-        if (!load_sd_image_from_file(gen_params.mask_image.put(),
-                                     gen_params.mask_image_path.c_str(),
-                                     0,
-                                     0,
-                                     1)) {
-            LOG_ERROR("load image from '%s' failed", gen_params.mask_image_path.c_str());
-            return 1;
-        }
-    }
-
-    if (gen_params.control_image_path.size() > 0) {
-        if (!load_sd_image_from_file(gen_params.control_image.put(),
-                                     gen_params.control_image_path.c_str(),
-                                     0,
-                                     0)) {
-            LOG_ERROR("load image from '%s' failed", gen_params.control_image_path.c_str());
-            return 1;
-        }
-    }
-
-    if (gen_params.ip_adapter_image_path.size() > 0) {
-        if (!load_sd_image_from_file(gen_params.ip_adapter_image.put(),
-                                     gen_params.ip_adapter_image_path.c_str(),
-                                     0,
-                                     0)) {
-            LOG_ERROR("load image from '%s' failed", gen_params.ip_adapter_image_path.c_str());
-            return 1;
-        }
-    }
-
-    if (!gen_params.control_video_path.empty()) {
-        gen_params.control_frames.clear();
-        if (!load_images_from_dir(gen_params.control_video_path,
-                                  gen_params.control_frames,
-                                  gen_params.video_frames)) {
-            return 1;
-        }
-    }
-
-    if (!gen_params.pm_id_images_dir.empty()) {
-        gen_params.pm_id_images.clear();
-        if (!load_images_from_dir(gen_params.pm_id_images_dir,
-                                  gen_params.pm_id_images)) {
-            return 1;
-        }
+    if (!load_generation_inputs(cli_params.mode, gen_params)) {
+        return 1;
     }
 
     sd_ctx_params_t sd_ctx_params = ctx_params.to_sd_ctx_params_t(cli_params.taesd_preview);

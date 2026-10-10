@@ -64,6 +64,12 @@ namespace sd::pipeline {
                         sd_audio_t** audio_out,
                         int* fps_out);
 
+    int generate_videos(StableDiffusionGGML* sd,
+                        const sd_vid_gen_params_t* const* params,
+                        int count,
+                        sd_video_result_cb_t result_cb,
+                        void* result_data);
+
     sd::Tensor<float> upscale_ltx_spatial_video_latent(StableDiffusionGGML* sd,
                                                        const char* model_path,
                                                        const sd::Tensor<float>& packed_latent,

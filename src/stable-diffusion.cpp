@@ -776,6 +776,26 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
     return sd::pipeline::generate_video(sd_ctx->sd, sd_vid_gen_params, frames_out, num_frames_out, audio_out, fps_out);
 }
 
+SD_API int generate_videos(sd_ctx_t* sd_ctx,
+                           const sd_vid_gen_params_t* const* params,
+                           int count,
+                           sd_video_result_cb_t result_cb,
+                           void* data) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || params == nullptr || count <= 0) {
+        return 0;
+    }
+    for (int i = 0; i < count; ++i) {
+        if (params[i] == nullptr) {
+            return 0;
+        }
+    }
+    StableDiffusionGGML::ExecutionScope execution(*sd_ctx->sd);
+    if (!execution.ready) {
+        return 0;
+    }
+    return sd::pipeline::generate_videos(sd_ctx->sd, params, count, result_cb, data);
+}
+
 SD_API void free_sd_images(sd_image_t* result_images, int num_images) {
     if (result_images == nullptr) {
         return;

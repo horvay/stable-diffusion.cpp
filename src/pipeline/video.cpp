@@ -1229,8 +1229,10 @@ namespace sd::pipeline {
     static std::optional<ImageGenerationEmbeds> prepare_video_generation_embeds(StableDiffusionGGML* sd,
                                                                                 const sd_vid_gen_params_t* sd_vid_gen_params,
                                                                                 const GenerationRequest& request,
-                                                                                const ImageGenerationLatents& latents) {
-        ConditionerRunnerEndOnExit conditioner_runner_end{sd->cond_stage_model.get()};
+                                                                                const ImageGenerationLatents& latents,
+                                                                                bool end_conditioner = true) {
+        // end_conditioner = false keeps the text encoder staged for the next job (multi-job batches)
+        ConditionerRunnerEndOnExit conditioner_runner_end{end_conditioner ? sd->cond_stage_model.get() : nullptr};
 
         ImageGenerationEmbeds embeds;
         ConditionerParams condition_params;
@@ -1617,40 +1619,75 @@ namespace sd::pipeline {
         return ok;
     }
 
-    bool generate_video(StableDiffusionGGML* sd,
-                        const sd_vid_gen_params_t* sd_vid_gen_params,
-                        sd_image_t** frames_out,
-                        int* num_frames_out,
-                        sd_audio_t** audio_out,
-                        int* fps_out) {
-        if (sd->config_->animatediff_loaded && sd_version_supports_animatediff(sd->version)) {
-            LOG_INFO("AnimateDiff dispatch: %d frames, %dx%d",
-                     sd_vid_gen_params->video_frames, sd_vid_gen_params->width, sd_vid_gen_params->height);
-            if (fps_out != nullptr) {
-                *fps_out = std::max(1, sd_vid_gen_params->fps);
-            }
-            return generate_animatediff_video(sd, sd_vid_gen_params, frames_out, num_frames_out);
-        }
+    // One video generation, split so a batch can run every job's conditioning first (text encoder loaded
+    // once, then freed) and then sample + decode the jobs with the diffusion weights resident.
+    struct VideoJob {
+        std::unique_ptr<sd::ImagePreprocessor> preprocessing;  // owns resized inputs processed_params points to
+        sd_vid_gen_params_t processed_params{};
+        std::optional<GenerationRequest> request;
+        std::optional<GenerationRequest> hires_request;
+        std::optional<SamplePlan> plan;
+        ImageGenerationLatents latents;
+        ImageGenerationEmbeds embeds;
+        bool latent_upscale_enabled = false;
+        int64_t t0                  = 0;
+    };
 
+    // Options for finish_video_job when it runs as part of a multi-job batch (nullptr = single run).
+    struct VideoBatchOptions {
+        bool keep_xpu_blocks = false;  // keep the SD_XPU_H3_LIB block weights resident between jobs
+        bool keep_vae_host   = true;   // keep a pinned host copy of the SD_XPU_H3VAE_LIB weights between jobs
+        bool any_loras       = false;  // some job in the batch has LoRAs: re-apply each job's set
+    };
+
+    // SD_XPU_H3VAE_LIB: hand the decoder's device memory back (no-op when the library was never loaded).
+    static void release_xpu_h3vae(bool keep_host) {
+        const char* path = getenv("SD_XPU_H3VAE_LIB");
+        if (path == nullptr || *path == '\0') {
+            return;
+        }
+        if (void* lib = dlopen(path, RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD)) {
+            if (auto release = reinterpret_cast<void (*)(int)>(dlsym(lib, "xpu_h3vae_release"))) {
+                release(keep_host ? 1 : 0);
+            }
+            dlclose(lib);
+        }
+    }
+
+    static void release_xpu_h3_blocks() {
+        if (const char* xpu_lib = getenv("SD_XPU_H3_LIB")) {
+            if (void* lib = dlopen(xpu_lib, RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD)) {
+                if (auto release = reinterpret_cast<void (*)()>(dlsym(lib, "xpu_h3_release"))) {
+                    release();
+                }
+                dlclose(lib);
+            }
+        }
+    }
+
+    // Request, preprocessing, seeds, sample plan and latent preparation (VAE encodes of the references).
+    static bool begin_video_job(StableDiffusionGGML* sd,
+                                const sd_vid_gen_params_t* sd_vid_gen_params,
+                                VideoJob& job,
+                                int* fps_out) {
         sd->reset_cancel_flag();
 
-        const RefImageParams ref_image_params;
-
-        int64_t t0            = ggml_time_ms();
+        job.t0                = ggml_time_ms();
         sd->vae_tiling_params = sd_vid_gen_params->vae_tiling_params;
         sd->apply_circular_axes(sd_vid_gen_params->circular_x, sd_vid_gen_params->circular_y);
-        GenerationRequest request(sd, sd_vid_gen_params);
-        sd::ImagePreprocessor preprocessing(sd_vid_gen_params->image_preprocess.rules);
-        sd_vid_gen_params_t processed_params = *sd_vid_gen_params;
-        if (!preprocessing.prepare_inputs(processed_params, request.width, request.height))
+        job.request.emplace(sd, sd_vid_gen_params);
+        GenerationRequest& request = *job.request;
+        job.preprocessing          = std::make_unique<sd::ImagePreprocessor>(sd_vid_gen_params->image_preprocess.rules);
+        job.processed_params       = *sd_vid_gen_params;
+        if (!job.preprocessing->prepare_inputs(job.processed_params, request.width, request.height))
             return false;
-        sd_vid_gen_params = &processed_params;
+        sd_vid_gen_params = &job.processed_params;
         if (fps_out != nullptr) {
             *fps_out = request.fps;
         }
-        bool latent_upscale_enabled     = request.hires.enabled;
-        GenerationRequest hires_request = request;
-        if (latent_upscale_enabled) {
+        job.latent_upscale_enabled = request.hires.enabled;
+        job.hires_request.emplace(request);
+        if (job.latent_upscale_enabled) {
             if (!sd_version_is_ltxav(sd->version)) {
                 LOG_ERROR("LTX latent spatial upscale is only supported for LTX video models");
                 return false;
@@ -1672,21 +1709,57 @@ namespace sd::pipeline {
             return false;
         sd->reset_generation_extensions();
 
-        SamplePlan plan(sd, sd_vid_gen_params, request);
+        job.plan.emplace(sd, sd_vid_gen_params, request);
         auto latent_inputs_opt = prepare_video_generation_latents(sd, sd_vid_gen_params, &request);
         if (!latent_inputs_opt.has_value()) {
             return false;
         }
-        ImageGenerationLatents latents = std::move(*latent_inputs_opt);
+        job.latents = std::move(*latent_inputs_opt);
+        return true;
+    }
 
+    // Text/vision conditioning through the text encoder.
+    static bool encode_video_job(StableDiffusionGGML* sd, VideoJob& job, bool end_conditioner) {
         auto embeds_opt = prepare_video_generation_embeds(sd,
-                                                          sd_vid_gen_params,
-                                                          request,
-                                                          latents);
+                                                          &job.processed_params,
+                                                          *job.request,
+                                                          job.latents,
+                                                          end_conditioner);
         if (!embeds_opt) {
             return false;
         }
-        ImageGenerationEmbeds embeds = std::move(*embeds_opt);
+        job.embeds = std::move(*embeds_opt);
+        return true;
+    }
+
+    // Sampling, audio decode and video decode.
+    static bool finish_video_job(StableDiffusionGGML* sd,
+                                 VideoJob& job,
+                                 sd_image_t** frames_out,
+                                 int* num_frames_out,
+                                 sd_audio_t** audio_out,
+                                 const VideoBatchOptions* batch) {
+        const RefImageParams ref_image_params;
+        const sd_vid_gen_params_t* sd_vid_gen_params = &job.processed_params;
+        GenerationRequest& request                   = *job.request;
+        GenerationRequest& hires_request             = *job.hires_request;
+        SamplePlan& plan                             = *job.plan;
+        ImageGenerationLatents& latents              = job.latents;
+        ImageGenerationEmbeds& embeds                = job.embeds;
+        const bool latent_upscale_enabled            = job.latent_upscale_enabled;
+        const int64_t t0                             = job.t0;
+        if (batch != nullptr) {
+            // other jobs ran their preparation since this one: restore its per-generation state
+            sd->reset_cancel_flag();
+            sd->vae_tiling_params = sd_vid_gen_params->vae_tiling_params;
+            sd->apply_circular_axes(sd_vid_gen_params->circular_x, sd_vid_gen_params->circular_y);
+            sd->set_flow_shift(sd_vid_gen_params->sample_params.flow_shift);
+            if (batch->any_loras && !sd->apply_loras(sd_vid_gen_params->loras, sd_vid_gen_params->lora_count))
+                return false;
+            sd->reset_generation_extensions();
+            sd->rng->manual_seed(request.seed);
+            sd->sampler_rng->manual_seed(request.seed);
+        }
         if (latent_upscale_enabled) {
             LOG_INFO("generate_video %dx%dx%d -> LTX latent spatial upscale",
                      request.width,
@@ -1695,6 +1768,7 @@ namespace sd::pipeline {
         } else {
             if (getenv("SD_XPU_H3_LIB") != nullptr && sd->model_manager != nullptr) {
                 // the XPU transformer blocks allocate through Level Zero on the same GPU
+                release_xpu_h3vae(batch != nullptr && batch->keep_vae_host);
                 sd->model_manager->release_idle_device_memory();
             }
             LOG_INFO("generate_video %dx%dx%d",
@@ -1798,13 +1872,9 @@ namespace sd::pipeline {
             return false;
         }
         LOG_INFO("sampling completed, taking %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
-        if (const char* xpu_lib = getenv("SD_XPU_H3_LIB")) {
+        if (batch == nullptr || !batch->keep_xpu_blocks) {
             // hand the GPU back to Vulkan for the VAE decode
-            if (void* lib = dlopen(xpu_lib, RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD)) {
-                if (auto release = reinterpret_cast<void (*)()>(dlsym(lib, "xpu_h3_release"))) {
-                    release();
-                }
-            }
+            release_xpu_h3_blocks();
         }
 
         if (latent_upscale_enabled) {
@@ -2028,6 +2098,7 @@ namespace sd::pipeline {
             return false;
         }
         auto result = decode_video_outputs(sd, latent_upscale_enabled ? hires_request : request, final_latent, num_frames_out);
+        release_xpu_h3vae(batch != nullptr && batch->keep_vae_host);
         LOG_DEBUG("decode_video_outputs returned %s", result == nullptr ? "nullptr (failed)" : "frames");
         if (result == nullptr) {
             free_sd_audio(generated_audio);
@@ -2061,6 +2132,128 @@ namespace sd::pipeline {
             free_sd_audio(generated_audio);
         }
         return true;
+    }
+
+
+    bool generate_video(StableDiffusionGGML* sd,
+                        const sd_vid_gen_params_t* sd_vid_gen_params,
+                        sd_image_t** frames_out,
+                        int* num_frames_out,
+                        sd_audio_t** audio_out,
+                        int* fps_out) {
+        if (sd->config_->animatediff_loaded && sd_version_supports_animatediff(sd->version)) {
+            LOG_INFO("AnimateDiff dispatch: %d frames, %dx%d",
+                     sd_vid_gen_params->video_frames, sd_vid_gen_params->width, sd_vid_gen_params->height);
+            if (fps_out != nullptr) {
+                *fps_out = std::max(1, sd_vid_gen_params->fps);
+            }
+            return generate_animatediff_video(sd, sd_vid_gen_params, frames_out, num_frames_out);
+        }
+
+        VideoJob job;
+        if (!begin_video_job(sd, sd_vid_gen_params, job, fps_out)) {
+            return false;
+        }
+        if (!encode_video_job(sd, job, true)) {
+            return false;
+        }
+        return finish_video_job(sd, job, frames_out, num_frames_out, audio_out, nullptr);
+    }
+
+    int generate_videos(StableDiffusionGGML* sd,
+                        const sd_vid_gen_params_t* const* params,
+                        int count,
+                        sd_video_result_cb_t result_cb,
+                        void* result_data) {
+        auto deliver = [&](int i, sd_image_t* frames, int num_frames, sd_audio_t* audio, int fps) {
+            if (result_cb != nullptr) {
+                result_cb(i, frames, num_frames, audio, fps, result_data);
+            } else {
+                free_sd_images(frames, num_frames);
+                free_sd_audio(audio);
+            }
+        };
+        int succeeded = 0;
+        if (!sd_version_is_minimax_h3(sd->version) || sd->config_->animatediff_loaded) {
+            LOG_WARN("multi-job batching is only implemented for MiniMax-H3; running %d jobs one at a time", count);
+            for (int i = 0; i < count; ++i) {
+                sd_image_t* frames = nullptr;
+                sd_audio_t* audio  = nullptr;
+                int num_frames = 0, fps = 0;
+                bool ok        = generate_video(sd, params[i], &frames, &num_frames, &audio, &fps);
+                succeeded += ok ? 1 : 0;
+                deliver(i, ok ? frames : nullptr, ok ? num_frames : 0, audio, fps);
+            }
+            return succeeded;
+        }
+
+        const int64_t batch_start = ggml_time_ms();
+        std::vector<VideoJob> jobs(static_cast<size_t>(count));
+        std::vector<bool> ok(static_cast<size_t>(count), false);
+        VideoBatchOptions options;
+        for (int i = 0; i < count; ++i) {
+            options.any_loras = options.any_loras || params[i]->lora_count > 0;
+        }
+        // Keep the transformer-block weights on the XPU between jobs when the VAE decode also runs there
+        // (~19.5 + 4.8 GB fit next to each other); with the Vulkan decoder they are released as in a single run.
+        // SD_MULTI_KEEP_XPU_BLOCKS=0/1 overrides.
+        options.keep_xpu_blocks = getenv("SD_XPU_H3VAE_LIB") != nullptr && *getenv("SD_XPU_H3VAE_LIB") != '\0';
+        if (const char* v = getenv("SD_MULTI_KEEP_XPU_BLOCKS")) {
+            options.keep_xpu_blocks = std::atoi(v) != 0;
+        }
+
+        // Phase 1: every job's reference latents (VAE encoder), then every job's conditioning with the text
+        // encoder staged once; then the text encoder is freed for good.
+        LOG_INFO("[multi] phase 1: preparing %d jobs", count);
+        int last_prepared = -1;
+        for (int i = 0; i < count; ++i) {
+            LOG_INFO("[multi] job %d/%d: prepare", i + 1, count);
+            ok[i] = begin_video_job(sd, params[i], jobs[i], nullptr);
+            if (!ok[i]) {
+                LOG_ERROR("[multi] job %d/%d: preparation failed", i + 1, count);
+            } else {
+                last_prepared = i;
+            }
+        }
+        for (int i = 0; i < count; ++i) {
+            if (!ok[i]) {
+                continue;
+            }
+            LOG_INFO("[multi] job %d/%d: encode conditioning", i + 1, count);
+            ok[i] = encode_video_job(sd, jobs[i], i == last_prepared);
+            if (!ok[i]) {
+                LOG_ERROR("[multi] job %d/%d: conditioning failed", i + 1, count);
+            }
+        }
+        if (!sd->release_conditioner()) {
+            LOG_WARN("[multi] the text encoder could not be released; continuing with it loaded");
+        }
+        LOG_INFO("[multi] phase 1 completed, taking %.2fs", (ggml_time_ms() - batch_start) * 1.0f / 1000);
+
+        // Phase 2: sample + decode each job.
+        for (int i = 0; i < count; ++i) {
+            if (!ok[i]) {
+                deliver(i, nullptr, 0, nullptr, 0);
+                continue;
+            }
+            LOG_INFO("[multi] job %d/%d: render", i + 1, count);
+            sd_image_t* frames = nullptr;
+            sd_audio_t* audio  = nullptr;
+            int num_frames     = 0;
+            const int fps      = jobs[i].request->fps;
+            ok[i]              = finish_video_job(sd, jobs[i], &frames, &num_frames, &audio, &options);
+            jobs[i]            = VideoJob();  // drop this job's latents and conditioning
+            if (!ok[i]) {
+                LOG_ERROR("[multi] job %d/%d: render failed", i + 1, count);
+            }
+            succeeded += ok[i] ? 1 : 0;
+            deliver(i, ok[i] ? frames : nullptr, ok[i] ? num_frames : 0, audio, fps);
+            LOG_INFO("[multi] job %d/%d: done (%s)", i + 1, count, ok[i] ? "ok" : "failed");
+        }
+        release_xpu_h3_blocks();
+        release_xpu_h3vae(false);
+        LOG_INFO("[multi] %d/%d jobs completed in %.2fs", succeeded, count, (ggml_time_ms() - batch_start) * 1.0f / 1000);
+        return succeeded;
     }
 
 }  // namespace sd::pipeline

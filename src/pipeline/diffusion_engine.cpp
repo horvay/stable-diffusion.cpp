@@ -1843,6 +1843,24 @@ SDCondition StableDiffusionGGML::get_learned_condition(const ConditionerParams& 
     return conditioning_cache_->get(*cond_stage_model, n_threads, params);
 }
 
+bool StableDiffusionGGML::release_conditioner() {
+    if (!cond_stage_model) {
+        return true;
+    }
+    conditioning_cache_->clear();
+    conditioning_loras_.clear();
+    cond_stage_model->set_weight_adapter(nullptr);
+    cond_stage_model->runner_end();
+    size_t released = 0;
+    if (model_manager != nullptr && !model_manager->unregister_param_tensors(ModelComponent::Conditioner, &released)) {
+        LOG_ERROR("failed to release the conditioner weights");
+        return false;
+    }
+    cond_stage_model.reset();
+    LOG_INFO("released the conditioner (%.2f MB of weights)", released / (1024.f * 1024.f));
+    return true;
+}
+
 void StableDiffusionGGML::reset_generation_extensions() {
     for (auto& extension : generation_extensions) {
         extension->reset_runtime_condition();

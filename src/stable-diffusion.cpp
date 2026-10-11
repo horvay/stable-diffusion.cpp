@@ -453,6 +453,7 @@ void sd_sample_params_init(sd_sample_params_t* sample_params) {
     sample_params->guidance.slg.layer_start    = 0.01f;
     sample_params->guidance.slg.layer_end      = 0.2f;
     sample_params->guidance.slg.scale          = 0.f;
+    sample_params->guidance.cfg_steps          = 0.f;
     sample_params->scheduler                   = SCHEDULER_COUNT;
     sample_params->sample_method               = SAMPLE_METHOD_COUNT;
     sample_params->sample_steps                = 20;

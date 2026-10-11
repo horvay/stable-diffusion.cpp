@@ -3,6 +3,7 @@
 #include <time.h>
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -94,10 +95,11 @@ struct SDCliParams {
              &imatrix_out},
             {"",
              "--multi-jobs",
-             "vid_gen: render several jobs in one process. FILE has one job per line, a JSON array of extra arguments "
-             "for that job (e.g. [\"-p\", \"...\", \"-r\", \"a.png\", \"--seed\", \"1\", \"-o\", \"out/raw.mp4\"]), appended to "
-             "this command line. MiniMax-H3 encodes every job's conditioning first, frees the text encoder, then "
-             "samples and decodes the jobs with the diffusion weights kept loaded",
+             "img_gen / vid_gen: render several jobs in one process. FILE has one job per line, a JSON array of extra "
+             "arguments for that job (e.g. [\"-p\", \"...\", \"-r\", \"a.png\", \"--seed\", \"1\", \"-o\", \"out/raw.mp4\"]), "
+             "appended to this command line. img_gen runs the jobs one after another with every model kept loaded. "
+             "MiniMax-H3 vid_gen encodes every job's conditioning first, frees the text encoder, then samples and "
+             "decodes the jobs with the diffusion weights kept loaded",
              0,
              &multi_jobs_path},
         };
@@ -648,6 +650,54 @@ static bool apply_adetailer(sd_ctx_t* sd_ctx,
     return true;
 }
 
+// --upscale-model / --upscale-repeats: upscale every result in place (main and the --multi-jobs image path).
+static void apply_upscaler(const SDContextParams& ctx_params,
+                           const SDGenerationParams& gen_params,
+                           const sd_ctx_params_t& sd_ctx_params,
+                           SDImageVec& results,
+                           int num_results) {
+    int upscale_factor = 4;  // unused for RealESRGAN_x4plus_anime_6B.pth
+    if (ctx_params.esrgan_path.size() > 0 && gen_params.upscale_repeats > 0) {
+        UpscalerCtxPtr upscaler_ctx(new_upscaler_ctx(ctx_params.esrgan_path.c_str(),
+                                                     ctx_params.diffusion_conv_direct,
+                                                     ctx_params.n_threads,
+                                                     gen_params.upscale_tile_size,
+                                                     sd_ctx_params.backend,
+                                                     sd_ctx_params.params_backend));
+
+        if (upscaler_ctx == nullptr) {
+            LOG_ERROR("new_upscaler_ctx failed");
+        } else {
+            for (int i = 0; i < num_results; i++) {
+                if (results[i].data == nullptr) {
+                    continue;
+                }
+                SDImageOwner current_image(results[i]);
+                results[i] = {0, 0, 0, nullptr};
+                for (int u = 0; u < gen_params.upscale_repeats; ++u) {
+                    sd_image_t* upscaled_images = nullptr;
+                    int upscaled_count          = 0;
+                    bool upscale_ok             = upscale(upscaler_ctx.get(),
+                                                          current_image.get(),
+                                                          upscale_factor,
+                                                          &upscaled_images,
+                                                          &upscaled_count);
+                    if (!upscale_ok || upscaled_count <= 0 || upscaled_images[0].data == nullptr) {
+                        free_sd_images(upscaled_images, upscaled_count);
+                        LOG_ERROR("upscale failed");
+                        break;
+                    }
+                    sd_image_t upscaled_image = upscaled_images[0];
+                    upscaled_images[0]        = {0, 0, 0, nullptr};
+                    free_sd_images(upscaled_images, upscaled_count);
+                    current_image.reset(upscaled_image);
+                }
+                results[i] = current_image.release();  // Set the final upscaled image as the result
+            }
+        }
+    }
+}
+
 // Load every image / audio / frame-directory input named in gen_params (main and the --multi-jobs path).
 static bool load_generation_inputs(SDMode mode, SDGenerationParams& gen_params) {
     auto load_image_and_update_size = [&](const std::string& path,
@@ -837,7 +887,8 @@ static bool load_generation_inputs(SDMode mode, SDGenerationParams& gen_params) 
 }
 
 // --multi-jobs FILE: each line is a JSON array of extra arguments for one job, parsed together with this command
-// line exactly as a separate sd-cli run would parse them; all jobs then run through generate_videos().
+// line exactly as a separate sd-cli run would parse them. vid_gen jobs run through generate_videos(); img_gen jobs
+// run one by one through generate_image() in one context (run_multi_image_jobs).
 struct MultiJob {
     SDCliParams cli;
     SDContextParams ctx;
@@ -871,16 +922,97 @@ static void multi_job_result(int index, sd_image_t* frames, int num_frames, sd_a
     free_sd_audio(audio);
 }
 
+// --multi-jobs with -M img_gen: one context (diffusion model, text encoder, VAE and any SD_XPU_QWEN21_LIB block
+// weights stay loaded), then for each job exactly what a single run does after new_sd_ctx(): load its inputs,
+// generate_image(), ADetailer, upscaler, save. A job's inputs, results and parsed parameters are freed as soon as it
+// is saved; generate_image() releases its own per-run compute buffers. A failed job is logged and skipped.
+static int64_t multi_now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static int run_multi_image_jobs(std::vector<std::unique_ptr<MultiJob>>& jobs,
+                                const SDCliParams& base_cli,
+                                SDContextParams& base_ctx,
+                                bool cache_size_given) {
+    // Jobs that share a negative prompt (and reference images) reuse its encoding; a cache hit returns the stored
+    // result of the identical computation. --conditioning-cache-size on the command line overrides.
+    if (!cache_size_given && base_ctx.conditioning_cache_size == 0) {
+        base_ctx.conditioning_cache_size = 4;
+    }
+    sd_ctx_params_t sd_ctx_params = base_ctx.to_sd_ctx_params_t(base_cli.taesd_preview);
+    const int64_t load_start      = multi_now_ms();
+    SDCtxPtr sd_ctx(new_sd_ctx(&sd_ctx_params));
+    if (sd_ctx == nullptr) {
+        LOG_INFO("new_sd_ctx_t failed");
+        return 1;
+    }
+    LOG_INFO("[multi] context ready in %.2fs; %zu image jobs", (multi_now_ms() - load_start) / 1000.f, jobs.size());
+
+    const size_t total = jobs.size();
+    int saved          = 0;
+    const int64_t t0   = multi_now_ms();
+    for (size_t i = 0; i < total; ++i) {
+        std::unique_ptr<MultiJob> job = std::move(jobs[i]);
+        const std::string out_path    = job->cli.output_path;
+        const int64_t job_start       = multi_now_ms();
+        LOG_INFO("[multi] job %zu/%zu start: %s (seed %lld)", i + 1, total, out_path.c_str(), (long long)job->gen.seed);
+        bool ok                 = false;
+        SDGenerationParams& gen = job->gen;
+        if (!load_generation_inputs(job->cli.mode, gen)) {
+            LOG_ERROR("[multi] job %zu: loading the inputs failed", i + 1);
+        } else {
+            if (gen.sample_params.sample_method == SAMPLE_METHOD_COUNT) {
+                gen.sample_params.sample_method = sd_get_default_sample_method(sd_ctx.get());
+            }
+            if (gen.high_noise_sample_params.sample_method == SAMPLE_METHOD_COUNT) {
+                gen.high_noise_sample_params.sample_method = sd_get_default_sample_method(sd_ctx.get());
+            }
+            if (gen.sample_params.scheduler == SCHEDULER_COUNT) {
+                gen.sample_params.scheduler = sd_get_default_scheduler(sd_ctx.get(), gen.sample_params.sample_method);
+            }
+            sd_img_gen_params_t img_gen_params = gen.to_sd_img_gen_params_t();
+            SDImageVec results;
+            int num_results              = 0;
+            sd_image_t* generated_images = nullptr;
+            if (!generate_image(sd_ctx.get(), &img_gen_params, &generated_images, &num_results)) {
+                generated_images = nullptr;
+                num_results      = 0;
+            }
+            results.adopt(generated_images, num_results);
+            if (!results) {
+                LOG_ERROR("[multi] job %zu: generate failed", i + 1);
+            } else if (apply_adetailer(sd_ctx.get(), sd_ctx_params, job->ctx, gen, img_gen_params, job->cli.mode, results, num_results)) {
+                apply_upscaler(base_ctx, gen, sd_ctx_params, results, num_results);
+                ok = save_results(job->cli, job->ctx, gen, results.data(), num_results);
+            }
+        }
+        job.reset();  // the job's input images, parameters and results
+        if (ok) {
+            ++saved;
+            LOG_INFO("[multi] job %zu/%zu saved %s in %.2fs", i + 1, total, out_path.c_str(), (multi_now_ms() - job_start) / 1000.f);
+        } else {
+            LOG_ERROR("[multi] job %zu/%zu (%s) failed after %.2fs", i + 1, total, out_path.c_str(), (multi_now_ms() - job_start) / 1000.f);
+        }
+    }
+    LOG_INFO("[multi] %d/%zu jobs saved in %.2fs (plus %.2fs context load)", saved, total, (multi_now_ms() - t0) / 1000.f,
+             (t0 - load_start) / 1000.f);
+    return saved == static_cast<int>(total) ? 0 : 1;
+}
+
 static int run_multi_jobs(int argc, const char* argv[], const SDCliParams& base_cli, SDContextParams& base_ctx) {
-    if (base_cli.mode != VID_GEN) {
-        LOG_ERROR("--multi-jobs needs -M vid_gen");
+    if (base_cli.mode != VID_GEN && base_cli.mode != IMG_GEN) {
+        LOG_ERROR("--multi-jobs needs -M img_gen or -M vid_gen");
         return 1;
     }
     std::vector<std::string> base_args;
+    bool cache_size_given = false;
     for (int i = 0; i < argc; ++i) {
         if (std::string(argv[i]) == "--multi-jobs") {
             ++i;  // and its value
             continue;
+        }
+        if (std::string(argv[i]) == "--conditioning-cache-size") {
+            cache_size_given = true;
         }
         base_args.push_back(argv[i]);
     }
@@ -924,9 +1056,29 @@ static int run_multi_jobs(int argc, const char* argv[], const SDCliParams& base_
             LOG_ERROR("--multi-jobs line %d: invalid arguments", line_no);
             return 1;
         }
-        if (!job->cli.multi_jobs_path.empty() || job->cli.mode != VID_GEN) {
+        if (!job->cli.multi_jobs_path.empty() || job->cli.mode != base_cli.mode) {
             LOG_ERROR("--multi-jobs line %d: jobs cannot change the mode or nest --multi-jobs", line_no);
             return 1;
+        }
+        if (base_cli.mode == IMG_GEN) {
+            // Inputs are loaded right before each job runs (and freed after it); check that they exist now.
+            std::vector<std::string> inputs = job->gen.ref_image_paths;
+            for (const std::string* path : {&job->gen.init_image_path, &job->gen.mask_image_path,
+                                            &job->gen.control_image_path, &job->gen.ip_adapter_image_path}) {
+                if (!path->empty()) {
+                    inputs.push_back(*path);
+                }
+            }
+            for (const auto& path : inputs) {
+                if (!fs::exists(path)) {
+                    LOG_ERROR("--multi-jobs line %d: input '%s' not found", line_no, path.c_str());
+                    return 1;
+                }
+            }
+            LOG_INFO("[multi] queued #%zu: %s (seed %lld, %zu refs)", jobs.size() + 1, job->cli.output_path.c_str(),
+                     (long long)job->gen.seed, job->gen.ref_image_paths.size());
+            jobs.push_back(std::move(job));
+            continue;
         }
         if (!load_generation_inputs(job->cli.mode, job->gen)) {
             LOG_ERROR("--multi-jobs line %d: loading the inputs failed", line_no);
@@ -939,6 +1091,9 @@ static int run_multi_jobs(int argc, const char* argv[], const SDCliParams& base_
     if (jobs.empty()) {
         LOG_ERROR("--multi-jobs file '%s' has no jobs", base_cli.multi_jobs_path.c_str());
         return 1;
+    }
+    if (base_cli.mode == IMG_GEN) {
+        return run_multi_image_jobs(jobs, base_cli, base_ctx, cache_size_given);
     }
 
     sd_ctx_params_t sd_ctx_params = base_ctx.to_sd_ctx_params_t(base_cli.taesd_preview);
@@ -1156,46 +1311,7 @@ int main(int argc, const char* argv[]) {
         }
     }
 
-    int upscale_factor = 4;  // unused for RealESRGAN_x4plus_anime_6B.pth
-    if (ctx_params.esrgan_path.size() > 0 && gen_params.upscale_repeats > 0) {
-        UpscalerCtxPtr upscaler_ctx(new_upscaler_ctx(ctx_params.esrgan_path.c_str(),
-                                                     ctx_params.diffusion_conv_direct,
-                                                     ctx_params.n_threads,
-                                                     gen_params.upscale_tile_size,
-                                                     sd_ctx_params.backend,
-                                                     sd_ctx_params.params_backend));
-
-        if (upscaler_ctx == nullptr) {
-            LOG_ERROR("new_upscaler_ctx failed");
-        } else {
-            for (int i = 0; i < num_results; i++) {
-                if (results[i].data == nullptr) {
-                    continue;
-                }
-                SDImageOwner current_image(results[i]);
-                results[i] = {0, 0, 0, nullptr};
-                for (int u = 0; u < gen_params.upscale_repeats; ++u) {
-                    sd_image_t* upscaled_images = nullptr;
-                    int upscaled_count          = 0;
-                    bool upscale_ok             = upscale(upscaler_ctx.get(),
-                                                          current_image.get(),
-                                                          upscale_factor,
-                                                          &upscaled_images,
-                                                          &upscaled_count);
-                    if (!upscale_ok || upscaled_count <= 0 || upscaled_images[0].data == nullptr) {
-                        free_sd_images(upscaled_images, upscaled_count);
-                        LOG_ERROR("upscale failed");
-                        break;
-                    }
-                    sd_image_t upscaled_image = upscaled_images[0];
-                    upscaled_images[0]        = {0, 0, 0, nullptr};
-                    free_sd_images(upscaled_images, upscaled_count);
-                    current_image.reset(upscaled_image);
-                }
-                results[i] = current_image.release();  // Set the final upscaled image as the result
-            }
-        }
-    }
+    apply_upscaler(ctx_params, gen_params, sd_ctx_params, results, num_results);
 
     if (!save_results(cli_params, ctx_params, gen_params, results.data(), num_results, generated_audio)) {
         free_sd_audio(generated_audio);

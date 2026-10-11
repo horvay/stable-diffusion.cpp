@@ -300,6 +300,10 @@ typedef struct {
     float img_cfg;
     float distilled_guidance;
     sd_slg_params_t slg;
+    // Classifier-free guidance cut-off: apply CFG (cond + uncond passes) only for the first N sampling steps and run
+    // cond-only (one model pass) for the rest. <= 0: every step (default). >= 1: a step count. (0, 1): a fraction of
+    // the sampling steps (rounded, at least 1). Applies to each sampling pass (base and hires) separately.
+    float cfg_steps;
 } sd_guidance_params_t;
 
 typedef struct {

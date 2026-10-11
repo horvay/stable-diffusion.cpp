@@ -84,6 +84,17 @@ At 1024x1536, 25 steps, CFG 3: Vulkan 8.4 s/step (226 s/image) -> XPU 1.4 s/step
 - `SD_XPU_QWEN21_TIMING=1` prints per-block times; `SD_XPU_QWEN21_VERBOSE=1` per-call times.
 - VAE: `--vae-tile-size 384 --vae-tile-overlap 0.125` decodes in 4.8 s vs 8.5 s at the 0.5 default with
   no visible seams; untiled decode is far slower (52 s).
+- Several stills per process: `sd-cli [model and context options] --multi-jobs jobs.jsonl` (default mode
+  img_gen). Each line is a JSON array of that still's generation options (`-p`, `-n`, `-r`, `--seed`, `-W`,
+  `-H`, `--steps`, `--cfg-scale`, `--cfg-steps`, `-o`, ...), parsed together with the command line exactly
+  like a separate run. The models (and the XPU block weights, which the library keeps for the process) load
+  once; each job then runs `generate_image()` and saves like a single run, and its inputs and results are
+  freed before the next job. The conditioning cache is on (4 entries) unless `--conditioning-cache-size` is
+  given, so a shared negative prompt is encoded once. `SD_XPU_QWEN21_LORA` is per process: jobs that need
+  different block LoRAs go in separate runs.
+- CFG cut-off: `--cfg-steps N` (or a fraction such as `0.6`) runs CFG for the first N steps and the
+  conditional pass alone afterwards, halving the model calls of the remaining steps; the XPU blocks run one
+  call per condition, so the uncond call is simply skipped. Default `all`.
 
 Build (DPC++ must match torch's SYCL runtime: torch 2.11+xpu ships libsycl.so.8 = DPC++ 2025.3.2):
 

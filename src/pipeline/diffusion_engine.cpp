@@ -2365,6 +2365,19 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
 
     size_t steps                = sigmas.size() - 1;
     bool terminal_sigma_is_zero = sigmas.back() == 0.f;
+
+    // CFG cut-off (guidance.cfg_steps): guided steps 1..cfg_step_limit, cond-only afterwards; 0 = every step.
+    int cfg_step_limit = 0;
+    if (guidance.cfg_steps > 0.f && std::isfinite(guidance.cfg_steps)) {
+        cfg_step_limit = guidance.cfg_steps < 1.f
+                             ? std::max(1, static_cast<int>(std::lround(guidance.cfg_steps * static_cast<float>(steps))))
+                             : static_cast<int>(std::lround(guidance.cfg_steps));
+        if (cfg_step_limit >= static_cast<int>(steps)) {
+            cfg_step_limit = 0;
+        } else if (!uncond.empty() || !img_uncond.empty()) {
+            LOG_INFO("CFG for the first %d of %zu steps, cond-only after that", cfg_step_limit, steps);
+        }
+    }
     bool has_skiplayer          = (slg_scale != 0.0f || slg_uncond) && !skip_layers.empty();
     if (has_skiplayer && !sd_version_is_dit(version)) {
         has_skiplayer = false;
@@ -2655,6 +2668,13 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
             } else {
                 skip_img_uncond = std::abs(effective_guidance_scale - 1.0f) < kEpsilon;
             }
+        }
+
+        // Past the CFG cut-off the guided prediction is the conditional one: skip the uncond passes.
+        // |step| is the 1-based sampler step (multi-evaluation samplers pass the same index for each evaluation).
+        if (cfg_step_limit > 0 && std::abs(step) > cfg_step_limit) {
+            skip_uncond     = true;
+            skip_img_uncond = true;
         }
 
         cond_out = run_condition(*positive_condition, c_concat_override);

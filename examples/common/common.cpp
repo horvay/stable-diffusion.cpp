@@ -12,6 +12,7 @@
 #include <regex>
 #include <sstream>
 #include <stdexcept>
+#include <cmath>
 #include <type_traits>
 
 #include <json.hpp>
@@ -1125,6 +1126,13 @@ ArgOptions SDGenerationParams::get_options() {
          0,
          &hires_upscaler},
         {"",
+         "--cfg-steps",
+         "apply classifier-free guidance only for the first N sampling steps, then run the conditional pass alone "
+         "(one model evaluation per step). N is a step count, a fraction of the steps in (0, 1) such as 0.6, or "
+         "'all' (default: all)",
+         0,
+         &cfg_steps},
+        {"",
          "--extra-sample-args",
          "extra sampler/scheduler/guidance args, key=value list. CFG supports guidance_schedule; APG supports apg_eta, apg_momentum, apg_norm_threshold, apg_norm_threshold_smoothing; SLG supports slg_uncond; lcm supports noise_clip_std, noise_scale_start, noise_scale_end; flux supports base_shift, max_shift; ltx2 supports max_shift, base_shift, stretch, terminal; euler_ge supports gamma; beta scheduler supports alpha, beta; logit_normal supports mu, std, logsnr_min, logsnr_max, resolution_aware; llada_image supports uniform; lms supports lms_max_order, lms_shift, lms_divisions; noise-injecting samplers support noise_sampler with value iid (default except for dpm++2m_sde_bt) or brownian_tree; brownian_tree_rng supports cpu (default), cuda, std_default or sampler_rng",
          (int)',',
@@ -2222,6 +2230,9 @@ bool SDGenerationParams::from_json_str(
             if (guidance_json.contains("distilled_guidance") && guidance_json["distilled_guidance"].is_number()) {
                 target_params.guidance.distilled_guidance = guidance_json["distilled_guidance"];
             }
+            if (guidance_json.contains("cfg_steps") && guidance_json["cfg_steps"].is_number()) {
+                target_params.guidance.cfg_steps = guidance_json["cfg_steps"];
+            }
             if (guidance_json.contains("slg") && guidance_json["slg"].is_object()) {
                 const json& slg_json = guidance_json["slg"];
                 if (slg_json.contains("layers") && slg_json["layers"].is_array()) {
@@ -2507,6 +2518,29 @@ bool SDGenerationParams::resolve(const std::string& lora_model_dir, const std::s
     if (seed < 0) {
         srand((int)time(nullptr));
         seed = rand();
+    }
+
+    if (!cfg_steps.empty()) {
+        float value = 0.f;
+        if (cfg_steps == "all") {
+            value = 0.f;
+        } else {
+            try {
+                size_t used = 0;
+                value       = std::stof(cfg_steps, &used);
+                if (used != cfg_steps.size()) {
+                    throw std::invalid_argument("trailing characters");
+                }
+            } catch (const std::exception&) {
+                LOG_ERROR("error: invalid --cfg-steps '%s' (expected 'all', a step count or a fraction in (0, 1))", cfg_steps.c_str());
+                return false;
+            }
+            if (!std::isfinite(value) || value <= 0.f || (value >= 1.f && value != std::floor(value))) {
+                LOG_ERROR("error: invalid --cfg-steps '%s' (expected 'all', a whole step count >= 1 or a fraction in (0, 1))", cfg_steps.c_str());
+                return false;
+            }
+        }
+        sample_params.guidance.cfg_steps = value;
     }
 
     if (strict) {
@@ -3038,6 +3072,9 @@ static json build_sampling_metadata_json(const sd_sample_params_t& sample_params
               }},
          }},
     };
+    if (sample_params.guidance.cfg_steps > 0.f) {
+        sampling["guidance"]["cfg_steps"] = sample_params.guidance.cfg_steps;
+    }
     if (sample_params.sample_method != SAMPLE_METHOD_COUNT) {
         sampling["method"] = safe_json_string(sd_sample_method_name(sample_params.sample_method));
     }
@@ -3224,6 +3261,11 @@ std::string get_image_params(const SDContextParams& ctx_params,
     }
     parameter_string += "Steps: " + std::to_string(gen_params.sample_params.sample_steps) + ", ";
     parameter_string += "CFG scale: " + std::to_string(gen_params.sample_params.guidance.txt_cfg) + ", ";
+    if (gen_params.sample_params.guidance.cfg_steps > 0.f) {
+        char cfg_steps_buf[32];
+        snprintf(cfg_steps_buf, sizeof(cfg_steps_buf), "%g", gen_params.sample_params.guidance.cfg_steps);
+        parameter_string += std::string("CFG steps: ") + cfg_steps_buf + ", ";
+    }
     if (gen_params.sample_params.guidance.slg.scale != 0 && gen_params.skip_layers.size() != 0) {
         parameter_string += "SLG scale: " + std::to_string(gen_params.sample_params.guidance.slg.scale) + ", ";
         parameter_string += "Skip layers: [";

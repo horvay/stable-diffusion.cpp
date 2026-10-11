@@ -232,6 +232,7 @@ struct SDGenerationParams {
     sd_sample_params_t high_noise_sample_params;
     std::string extra_sample_args;
     std::string high_noise_extra_sample_args;
+    std::string cfg_steps;  // --cfg-steps: "all" (default), a step count N, or a fraction in (0, 1)
     std::vector<int> skip_layers            = {7, 8, 9};
     std::vector<int> high_noise_skip_layers = {7, 8, 9};
 

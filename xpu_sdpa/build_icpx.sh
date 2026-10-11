@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# DEPRECATED for xpu_h3 / xpu_qwen21: those sources are native SYCL + oneDNN now and build with build_native.sh.
+# (Kept for building torch-based experiments; torchref/build_torchref.sh builds the libtorch self-test references.)
 # Build SYCL/oneDNN helper libraries with Intel's DPC++ compiler (icpx); the version must match the venv's
 # SYCL runtime (torch 2.11+xpu ships libsycl.so.8 = DPC++ 2025.3.2).
 #   ONEAPI=~/opt/oneapi-2025.3/opt/intel/oneapi   DPC++ 2025.3.2 unpacked from Intel's APT packages
@@ -16,7 +18,7 @@ LIBDIR=$(cd "$(dirname "$TORCH")/../.." && pwd)
 export PATH=$CMPLR/bin:$PATH LD_LIBRARY_PATH=$CMPLR/lib:$ONEAPI/umf/1.0/lib:$ONEAPI/tcm/1.4/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 
 srcs=("$@")
-[[ ${#srcs[@]} -gt 0 ]] || srcs=("$HERE/xpu_qwen21.cpp" "$HERE/xpu_h3.cpp")
+[[ ${#srcs[@]} -gt 0 ]] || { echo "build_icpx.sh: pass the torch-based sources to build (the block libraries use build_native.sh)" >&2; exit 2; }
 for src in "${srcs[@]}"; do
   name=$(basename "${src%.cpp}")
   out="$(dirname "$src")/lib$name.so"

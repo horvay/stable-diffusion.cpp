@@ -1,2 +1,4 @@
 *.so
 *.so.new
+/xpu_selftest
+/xpu_selftest.new

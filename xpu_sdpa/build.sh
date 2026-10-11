@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
-# Build the Intel XPU helper libraries that sd.cpp dlopens:
-#   libxpu_h3vae.so - MiniMax-H3 video VAE decoder on the XPU (SD_XPU_H3VAE_LIB)
+# Build the remaining libtorch-based XPU helper library that sd.cpp dlopens:
 #   libxpu_sdpa.so  - attention-only offload (SD_XPU_SDPA_LIB)
-#   (libxpu_h3.so, the MiniMax-H3 blocks, and libxpu_qwen21.so, the Qwen Image 2.1 blocks, have SYCL kernels
-#    and build with build_icpx.sh instead)
+# (libxpu_h3.so, libxpu_h3vae.so and libxpu_qwen21.so are native SYCL + oneDNN now: build_native.sh)
 #
 # Needs a Python venv with PyTorch for XPU, e.g.:
 #   python -m venv .venv-xpu && .venv-xpu/bin/pip install torch --index-url https://download.pytorch.org/whl/xpu
@@ -16,7 +14,7 @@ TORCH=$("$VENV/bin/python" -c 'import os, torch; print(os.path.dirname(torch.__f
 SITE=$(dirname "$TORCH")
 LIBDIR=$(cd "$SITE/../.." && pwd)  # venv lib/ (libsycl, MKL)
 
-for name in ${XPU_LIBS:-xpu_h3vae xpu_sdpa}; do
+for name in ${XPU_LIBS:-xpu_sdpa}; do
   g++ -O2 -std=c++17 -fPIC -shared -pthread -D_GLIBCXX_USE_CXX11_ABI=1 \
     -I"$TORCH/include" -I"$TORCH/include/torch/csrc/api/include" \
     "$HERE/$name.cpp" -o "$HERE/lib$name.so.new" \

@@ -787,6 +787,25 @@ namespace MiniMaxH3 {
                     const auto* hh = dst->src[0];
                     const auto* tt = dst->src[1];
                     const auto* pp = dst->src[2];
+                    // SD_DUMP_DIR: also dump the XPU blocks' inputs (hidden state, time embedding, RoPE table), to tell
+                    // backend differences in the embeddings apart from the blocks' own sensitivity.
+                    if (const char* dump_dir = getenv("SD_DUMP_DIR")) {
+                        static int call = 0;
+                        const ggml_tensor* ins[3] = {hh, tt, pp};
+                        const char* names[3]      = {"h", "temb", "pe"};
+                        for (int k = 0; k < 3; ++k) {
+                            char path[1024];
+                            snprintf(path, sizeof(path), "%s/xpu_in_%02d_%s.f32", dump_dir, call, names[k]);
+                            if (FILE* f = fopen(path, "wb")) {
+                                int64_t nd = 4;
+                                fwrite(&nd, sizeof(nd), 1, f);
+                                fwrite(ins[k]->ne, sizeof(int64_t), 4, f);
+                                fwrite(ins[k]->data, sizeof(float), static_cast<size_t>(ggml_nelements(ins[k])), f);
+                                fclose(f);
+                            }
+                        }
+                        ++call;
+                    }
                     int rc         = a->fn(static_cast<const float*>(hh->data), ggml_nrows(hh), hh->ne[0],
                                            static_cast<const float*>(tt->data), ggml_nrows(tt), tt->ne[0],
                                            static_cast<const float*>(pp->data), pp->ne[2],

@@ -2,8 +2,10 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <map>
+#include <vector>
 #include <utility>
 
 #include "core/ggml_extend.h"
@@ -596,10 +598,15 @@ void GGMLRunner::cache(const std::string name, ggml_tensor* tensor, ggml_cgraph*
 
 // SD_DUMP_DIR=<dir>: write every runner output as <dir>/<NNNN>_<desc>.f32 (int64 ndim, int64 shape[ndim], float data)
 // so two backends can be compared on the same run (xpu_sdpa/compare_dumps.py). Debug only.
-static void dump_output(const std::string& desc, const sd::Tensor<float>& t) {
-    static const char* dir = getenv("SD_DUMP_DIR");
-    static int seq          = 0;
-    if (dir == nullptr || *dir == 0) {
+// SD_DUMP_REPLAY_DIR=<dir> + SD_DUMP_REPLAY_MATCH=a,b: outputs of runners whose desc is a or b are replaced by
+// the file with the same name from an earlier dump (same job, same order), so later stages get identical inputs and
+// each stage can be compared on its own.
+static void dump_output(const std::string& desc, sd::Tensor<float>& t) {
+    static const char* dir    = getenv("SD_DUMP_DIR");
+    static const char* replay = getenv("SD_DUMP_REPLAY_DIR");
+    static const char* match  = getenv("SD_DUMP_REPLAY_MATCH");
+    static int seq            = 0;
+    if ((dir == nullptr || *dir == 0) && (replay == nullptr || *replay == 0)) {
         return;
     }
     std::string name = desc;
@@ -608,8 +615,41 @@ static void dump_output(const std::string& desc, const sd::Tensor<float>& t) {
             c = '_';
         }
     }
+    const int this_seq = seq++;
     char path[1024];
-    snprintf(path, sizeof(path), "%s/%04d_%s.f32", dir, seq++, name.c_str());
+    if (replay != nullptr && *replay != 0 && match != nullptr) {
+        bool hit = false;
+        for (const char* m = match; *m;) {
+            const char* e = strchr(m, ',');
+            std::string key(m, e ? e - m : strlen(m));
+            if (!key.empty() && desc == key) {
+                hit = true;
+            }
+            m = e ? e + 1 : m + strlen(m);
+        }
+        snprintf(path, sizeof(path), "%s/%04d_%s.f32", replay, this_seq, name.c_str());
+        FILE* rf = hit ? fopen(path, "rb") : nullptr;
+        if (hit && rf == nullptr) {
+            LOG_ERROR("SD_DUMP_REPLAY_DIR: no %s", path);
+        }
+        if (rf != nullptr) {
+            int64_t nd = 0;
+            bool ok = fread(&nd, sizeof(nd), 1, rf) == 1 && nd == t.dim();
+            std::vector<int64_t> shape(static_cast<size_t>(std::max<int64_t>(nd, 0)));
+            ok = ok && fread(shape.data(), sizeof(int64_t), shape.size(), rf) == shape.size() && shape == t.shape();
+            ok = ok && fread(t.data(), sizeof(float), static_cast<size_t>(t.numel()), rf) == static_cast<size_t>(t.numel());
+            fclose(rf);
+            if (!ok) {
+                LOG_ERROR("SD_DUMP_REPLAY_DIR: %s does not match this output", path);
+            } else {
+                LOG_INFO("SD_DUMP_REPLAY_DIR: replaced %s output with %s", desc.c_str(), path);
+            }
+        }
+    }
+    if (dir == nullptr || *dir == 0) {
+        return;
+    }
+    snprintf(path, sizeof(path), "%s/%04d_%s.f32", dir, this_seq, name.c_str());
     FILE* f = fopen(path, "wb");
     if (f == nullptr) {
         LOG_ERROR("SD_DUMP_DIR: cannot write %s", path);

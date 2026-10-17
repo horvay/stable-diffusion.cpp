@@ -1,4 +1,7 @@
 #include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <map>
 #include <utility>
@@ -591,6 +594,34 @@ void GGMLRunner::cache(const std::string name, ggml_tensor* tensor, ggml_cgraph*
     }
 }
 
+// SD_DUMP_DIR=<dir>: write every runner output as <dir>/<NNNN>_<desc>.f32 (int64 ndim, int64 shape[ndim], float data)
+// so two backends can be compared on the same run (xpu_sdpa/compare_dumps.py). Debug only.
+static void dump_output(const std::string& desc, const sd::Tensor<float>& t) {
+    static const char* dir = getenv("SD_DUMP_DIR");
+    static int seq          = 0;
+    if (dir == nullptr || *dir == 0) {
+        return;
+    }
+    std::string name = desc;
+    for (char& c : name) {
+        if (!isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '-') {
+            c = '_';
+        }
+    }
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%04d_%s.f32", dir, seq++, name.c_str());
+    FILE* f = fopen(path, "wb");
+    if (f == nullptr) {
+        LOG_ERROR("SD_DUMP_DIR: cannot write %s", path);
+        return;
+    }
+    int64_t nd = t.dim();
+    fwrite(&nd, sizeof(nd), 1, f);
+    fwrite(t.shape().data(), sizeof(int64_t), static_cast<size_t>(nd), f);
+    fwrite(t.data(), sizeof(float), static_cast<size_t>(t.numel()), f);
+    fclose(f);
+}
+
 std::optional<sd::Tensor<float>> GGMLRunner::compute(get_graph_cb_t get_graph,
                                                      int n_threads,
                                                      bool auto_runner_end,
@@ -662,6 +693,7 @@ std::optional<sd::Tensor<float>> GGMLRunner::compute(get_graph_cb_t get_graph,
     }
     success = output.has_value();
     if (success) {
+        dump_output(get_desc(), *output);
         cache_.graph_end(true);
         last_compute_status_ = GGML_STATUS_SUCCESS;
     }

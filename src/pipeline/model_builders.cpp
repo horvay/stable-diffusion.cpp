@@ -653,6 +653,13 @@ namespace sd::model_builders {
                 result.preview->set_conv3d_direct_enabled(true);
             }
         }
+#ifdef SD_USE_SYCL
+        // ggml-sycl runs CONV_3D as one oneDNN convolution; the im2col route writes a copy 27x the input, which was
+        // 61% of a 1080p H3 VAE encode. SD_SYCL_CONV3D_IM2COL=1 keeps the im2col route.
+        if (result.vae && getenv("SD_SYCL_CONV3D_IM2COL") == nullptr) {
+            result.vae->set_conv3d_direct_enabled(true);
+        }
+#endif
         if (result.vae) {
             result.vae->set_scale_overrides(sd_ctx_params->linear_scale, sd_ctx_params->attn_scale);
         }

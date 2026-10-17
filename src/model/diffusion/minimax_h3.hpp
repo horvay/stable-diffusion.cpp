@@ -564,6 +564,37 @@ namespace MiniMaxH3 {
         return fn;
     }
 
+    using XpuH3SetControlFn = int (*)(const float*, int64_t, int64_t, const int8_t*);
+
+    static XpuH3SetControlFn xpu_h3_set_control_fn() {
+        static const XpuH3SetControlFn fn = []() -> XpuH3SetControlFn {
+            const char* path = getenv("SD_XPU_H3_LIB");
+            if (path == nullptr || *path == '\0') {
+                return nullptr;
+            }
+            void* lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+            return lib == nullptr ? nullptr : reinterpret_cast<XpuH3SetControlFn>(dlsym(lib, "xpu_h3_set_control"));
+        }();
+        return fn;
+    }
+
+    // Fun ControlNet-Union input (--control-video with SD_XPU_H3_CONTROL in the XPU block library): the VAE latent of
+    // the control video, set by the video pipeline, and the control rows built from it for the packed sequence.
+    struct ControlLatent {
+        std::vector<float> data;  // ggml order [C][T][H][W]
+        int64_t W = 0, H = 0, T = 0, C = 0;
+        std::vector<float> rows;    // [n_rows, cols]
+        std::vector<int8_t> kinds;  // [n_rows]: 0 other, 1 video, 2 audio
+        int64_t cols = 0;
+    };
+
+    inline ControlLatent& control_latent() {
+        static ControlLatent c;
+        return c;
+    }
+
+    static constexpr int64_t CONTROL_IN_DIM = 49;  // ComfyUI MiniMaxH3FunControl control_in_dim
+
     struct MiniMaxH3Transformer3DModel : public GGMLBlock {
         Config config;
 
@@ -757,6 +788,70 @@ namespace MiniMaxH3 {
             }
             GGML_ASSERT(h != nullptr);
 
+            // Fun ControlNet: control rows aligned with the packed sequence (target video rows = the patchified
+            // control latent, zero-padded to CONTROL_IN_DIM channels like ComfyUI; zeros elsewhere)
+            auto& ctl        = control_latent();
+            bool use_control = false;
+            if (!ctl.data.empty() && xpu_h3_blocks_fn() != nullptr) {
+                const int64_t pt = config.patch_t, ph = config.patch_h, pw = config.patch_w;
+                if (ctl.W != video->ne[0] || ctl.H != video->ne[1] || ctl.T != video->ne[2] || ctl.C > CONTROL_IN_DIM) {
+                    LOG_WARN("MiniMax-H3 control latent %lldx%lldx%lldx%lld does not match the target %lldx%lldx%lld: control off",
+                             (long long)ctl.W, (long long)ctl.H, (long long)ctl.T, (long long)ctl.C,
+                             (long long)video->ne[0], (long long)video->ne[1], (long long)video->ne[2]);
+                } else {
+                    const int64_t tl = ctl.T / pt, hl = ctl.H / ph, wl = ctl.W / pw;
+                    const int64_t cols   = CONTROL_IN_DIM * pt * ph * pw;
+                    const int64_t n_rows = h->ne[1];
+                    ctl.cols             = cols;
+                    ctl.rows.assign(static_cast<size_t>(n_rows * cols), 0.f);
+                    ctl.kinds.assign(static_cast<size_t>(n_rows), 0);
+                    int64_t row = 0;
+                    for (const auto& sequence : sequence_segments) {
+                        int64_t n   = 0;
+                        int8_t kind = 0;
+                        if (sequence.kind == SequenceKind::TEXT) {
+                            n = context->ne[1];
+                        } else if (sequence.kind == SequenceKind::CONDITION_VIDEO) {
+                            auto range = condition_video_ranges[static_cast<size_t>(sequence.source_index)];
+                            n          = range.second - range.first;
+                            kind       = 1;
+                        } else if (sequence.kind == SequenceKind::CONDITION_AUDIO) {
+                            auto range = condition_audio_ranges[static_cast<size_t>(sequence.source_index)];
+                            n          = range.second - range.first;
+                            kind       = 2;
+                        } else if (sequence.kind == SequenceKind::TARGET_AUDIO) {
+                            n    = target_audio_range.second - target_audio_range.first;
+                            kind = 2;
+                        } else {
+                            n    = target_video_range.second - target_video_range.first;
+                            kind = 1;
+                            GGML_ASSERT(n == tl * hl * wl);
+                            for (int64_t t = 0; t < tl; ++t) {
+                                for (int64_t y = 0; y < hl; ++y) {
+                                    for (int64_t x = 0; x < wl; ++x) {
+                                        float* dst = ctl.rows.data() + ((row + (t * hl + y) * wl + x) * cols);
+                                        for (int64_t c = 0; c < ctl.C; ++c) {
+                                            for (int64_t a = 0; a < pt; ++a) {
+                                                for (int64_t b = 0; b < ph; ++b) {
+                                                    for (int64_t d = 0; d < pw; ++d) {
+                                                        const int64_t src = ((c * ctl.T + t * pt + a) * ctl.H + y * ph + b) * ctl.W + x * pw + d;
+                                                        dst[((c * pt + a) * ph + b) * pw + d] = ctl.data[static_cast<size_t>(src)];
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        std::fill(ctl.kinds.begin() + row, ctl.kinds.begin() + row + n, kind);
+                        row += n;
+                    }
+                    GGML_ASSERT(row == n_rows);
+                    use_control = true;
+                }
+            }
+
             auto t_emb = time_embedding(ctx,
                                         timestep_features,
                                         curve_indices,
@@ -770,8 +865,9 @@ namespace MiniMaxH3 {
                     std::vector<int64_t> segments;
                     int64_t heads;
                     int64_t head_dim;
+                    bool control;
                 };
-                auto* ud     = new XpuH3Args{blocks_fn, {}, config.num_attention_heads, config.attention_head_dim};
+                auto* ud     = new XpuH3Args{blocks_fn, {}, config.num_attention_heads, config.attention_head_dim, use_control};
                 for (const auto& seg : segments) {
                     ud->segments.insert(ud->segments.end(), {seg.start, seg.end, seg.modulation_row});
                 }
@@ -805,6 +901,14 @@ namespace MiniMaxH3 {
                             }
                         }
                         ++call;
+                    }
+                    if (auto set_control = xpu_h3_set_control_fn()) {
+                        const auto& c = control_latent();
+                        if (a->control) {
+                            set_control(c.rows.data(), static_cast<int64_t>(c.kinds.size()), c.cols, c.kinds.data());
+                        } else {
+                            set_control(nullptr, 0, 0, nullptr);
+                        }
                     }
                     int rc         = a->fn(static_cast<const float*>(hh->data), ggml_nrows(hh), hh->ne[0],
                                            static_cast<const float*>(tt->data), ggml_nrows(tt), tt->ne[0],

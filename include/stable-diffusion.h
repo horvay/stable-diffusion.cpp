@@ -285,6 +285,11 @@ typedef struct {
     sd_audio_t audio;
     int frame_idx;   // negative counts from the end
     float strength;  // visual_cond_noise_aug; 1.0 pins at t=0.999
+    // Optional video guide (ComfyUI MiniMaxH3AddGuide with a frame batch): frames encoded as one multi-frame latent
+    // starting at frame_idx, e.g. the source clip of a same-length V2V pass such as the LMS sharpness LoRA. When set,
+    // image is ignored.
+    sd_image_t* frames;
+    int frame_count;
 } sd_minimax_guide_t;
 
 typedef struct {

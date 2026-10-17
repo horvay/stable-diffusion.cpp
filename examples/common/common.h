@@ -295,6 +295,7 @@ struct SDGenerationParams {
     std::vector<SDAudioOwner> ref_video_audios;
     std::vector<SDAudioOwner> ref_audios;
     std::vector<SDImageOwner> guide_images;
+    std::vector<std::vector<SDImageOwner>> guide_videos;  // per guide; non-empty = video guide (PATH is a frame dir)
     std::vector<SDAudioOwner> guide_audios;
     std::vector<int> guide_frame_idxs;
     std::vector<float> guide_strengths;
@@ -311,6 +312,7 @@ struct SDGenerationParams {
     std::vector<sd_ref_video_t> ref_video_views;
     std::vector<sd_audio_t> ref_audio_views;
     std::vector<sd_minimax_guide_t> guide_views;
+    std::vector<std::vector<sd_image_t>> guide_video_frame_views;
     std::vector<sd_image_t> pm_id_image_views;
     std::vector<sd_image_t> control_frame_views;
 

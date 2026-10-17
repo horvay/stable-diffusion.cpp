@@ -2850,11 +2850,20 @@ sd_vid_gen_params_t SDGenerationParams::to_sd_vid_gen_params_t() {
     }
 
     guide_views.clear();
+    guide_video_frame_views.assign(guide_images.size(), {});
     for (size_t i = 0; i < guide_images.size(); ++i) {
         sd_minimax_guide_t guide = {};
         guide.image              = guide_images[i].get();
         guide.frame_idx          = guide_frame_idxs[i];
         guide.strength           = guide_strengths[i];
+        if (i < guide_videos.size() && !guide_videos[i].empty()) {
+            auto& views = guide_video_frame_views[i];
+            for (auto& frame : guide_videos[i]) {
+                views.push_back(frame.get());
+            }
+            guide.frames      = views.data();
+            guide.frame_count = static_cast<int>(views.size());
+        }
         guide_views.push_back(guide);
     }
     for (size_t i = 0; i < guide_audios.size(); ++i) {

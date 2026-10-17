@@ -801,6 +801,7 @@ static bool load_generation_inputs(SDMode mode, SDGenerationParams& gen_params) 
     };
 
     gen_params.guide_images.clear();
+    gen_params.guide_videos.clear();
     gen_params.guide_frame_idxs.clear();
     gen_params.guide_strengths.clear();
     for (const auto& spec : gen_params.guide_specs) {
@@ -812,10 +813,18 @@ static bool load_generation_inputs(SDMode mode, SDGenerationParams& gen_params) 
             return false;
         }
         SDImageOwner image({0, 0, 0, nullptr});
-        if (!load_image_and_update_size(path, image)) {
+        std::vector<SDImageOwner> frames;
+        if (fs::is_directory(path)) {
+            // video guide: every image in the directory, in name order, from FRAME on
+            if (!load_images_from_dir(path, frames, gen_params.video_frames) || frames.empty()) {
+                LOG_ERROR("--guide '%s': no frames in the directory", spec.c_str());
+                return false;
+            }
+        } else if (!load_image_and_update_size(path, image)) {
             return false;
         }
         gen_params.guide_images.push_back(std::move(image));
+        gen_params.guide_videos.push_back(std::move(frames));
         gen_params.guide_frame_idxs.push_back(frame);
         gen_params.guide_strengths.push_back(strength);
     }

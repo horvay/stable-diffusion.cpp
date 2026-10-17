@@ -505,9 +505,40 @@ namespace sd::pipeline {
                 return std::nullopt;
             }
 
+            auto& control = MiniMaxH3::control_latent();
+            control       = MiniMaxH3::ControlLatent{};
             if (sd_vid_gen_params->control_frames_size > 0) {
-                LOG_ERROR("MiniMax-H3 control_frames are not implemented");
-                return std::nullopt;
+                // Fun ControlNet-Union: VAE-encode the control video at the target size and length (frames past the
+                // end repeat the last one), as ComfyUI MiniMaxH3FunControlPatch does. The XPU block library applies it
+                // (SD_XPU_H3_CONTROL); without that library the control is ignored.
+                if (getenv("SD_XPU_H3_LIB") == nullptr || getenv("SD_XPU_H3_CONTROL") == nullptr) {
+                    LOG_ERROR("MiniMax-H3 --control-video needs SD_XPU_H3_LIB and SD_XPU_H3_CONTROL");
+                    return std::nullopt;
+                }
+                sd::Tensor<float> video({request->width, request->height, request->frames, 3, 1});
+                for (int frame = 0; frame < request->frames; ++frame) {
+                    int source  = std::min(frame, sd_vid_gen_params->control_frames_size - 1);
+                    auto image  = ensure_image_tensor_channels(
+                        sd_image_to_tensor(sd_vid_gen_params->control_frames[source], request->width, request->height), 3);
+                    if (image.empty()) {
+                        LOG_ERROR("invalid MiniMax-H3 control frame %d", source + 1);
+                        return std::nullopt;
+                    }
+                    sd::ops::slice_assign(&video, 2, frame, frame + 1, image.unsqueeze(2));
+                }
+                auto latent = sd->encode_first_stage(video);
+                if (latent.empty() || latent.shape().size() < 4) {
+                    LOG_ERROR("failed to encode the MiniMax-H3 control video");
+                    return std::nullopt;
+                }
+                control.W = latent.shape()[0];
+                control.H = latent.shape()[1];
+                control.T = latent.shape()[2];
+                control.C = latent.shape()[3];
+                control.data.assign(latent.data(), latent.data() + control.W * control.H * control.T * control.C);
+                LOG_INFO("MiniMax-H3 control video: %d frames (%d given) -> latent %lldx%lldx%lldx%lld",
+                         request->frames, sd_vid_gen_params->control_frames_size, (long long)control.W, (long long)control.H,
+                         (long long)control.T, (long long)control.C);
             }
 
             auto add_visual_noise = [&](sd::Tensor<float> latent, float strength = 1.f) {
@@ -743,7 +774,37 @@ namespace sd::pipeline {
                         return std::nullopt;
                     }
                     MiniMaxH3ReferenceBlock block{MiniMaxH3ReferenceKind::GUIDE, -1, -1, frame_idx};
-                    if (guide.image.data != nullptr) {
+                    if (guide.frames != nullptr && guide.frame_count > 0) {
+                        // Video guide: frames frame_idx.. as one multi-frame latent at the target size, so its latent
+                        // frames sit on the output's own temporal positions (MiniMaxH3AddGuide with a frame batch).
+                        int count = std::min(guide.frame_count, request->frames - frame_idx);
+                        sd::Tensor<float> video({request->width, request->height, count, 3, 1});
+                        for (int f = 0; f < count; ++f) {
+                            auto image = ensure_image_tensor_channels(
+                                sd_image_to_tensor(guide.frames[f], request->width, request->height), 3);
+                            if (image.empty()) {
+                                LOG_ERROR("invalid frame %d in MiniMax-H3 video guide %d", f + 1, i + 1);
+                                return std::nullopt;
+                            }
+                            sd::ops::slice_assign(&video, 2, f, f + 1, image.unsqueeze(2));
+                        }
+                        auto latent = sd->encode_first_stage(video);
+                        if (latent.empty() || latent.shape().size() < 4) {
+                            LOG_ERROR("failed to encode MiniMax-H3 video guide %d", i + 1);
+                            return std::nullopt;
+                        }
+                        LOG_INFO("MiniMax-H3 guide %d: video of %d frames -> latent %lldx%lldx%lld", i + 1, count,
+                                 (long long)latent.shape()[0], (long long)latent.shape()[1], (long long)latent.shape()[2]);
+                        float strength = guide.strength > 0.f ? guide.strength : 1.f;
+                        float aug      = std::min(strength, 1.f);
+                        if (aug >= 1.f) {
+                            aug = MiniMaxH3::VISUAL_COND_TIMESTEP;
+                        }
+                        latents.visual_cond_augs.resize(latents.ref_latents.size(), MiniMaxH3::VISUAL_COND_TIMESTEP);
+                        block.video_index = static_cast<int32_t>(latents.ref_latents.size());
+                        latents.ref_latents.push_back(add_visual_noise(std::move(latent), strength));
+                        latents.visual_cond_augs.push_back(aug);
+                    } else if (guide.image.data != nullptr) {
                         auto image = ensure_image_tensor_channels(
                             sd_image_to_tensor(guide.image, request->width, request->height),
                             sd->get_image_channels());
@@ -1629,6 +1690,7 @@ namespace sd::pipeline {
         std::optional<SamplePlan> plan;
         ImageGenerationLatents latents;
         ImageGenerationEmbeds embeds;
+        MiniMaxH3::ControlLatent control;  // this job's --control-video latent (empty without one)
         bool latent_upscale_enabled = false;
         int64_t t0                  = 0;
     };
@@ -1715,6 +1777,10 @@ namespace sd::pipeline {
             return false;
         }
         job.latents = std::move(*latent_inputs_opt);
+        // prepare_video_generation_latents leaves the control latent in the model's slot; keep it with the job so a
+        // multi-job batch samples every job with its own control video
+        job.control                  = std::move(MiniMaxH3::control_latent());
+        MiniMaxH3::control_latent() = MiniMaxH3::ControlLatent{};
         return true;
     }
 
@@ -1748,6 +1814,7 @@ namespace sd::pipeline {
         ImageGenerationEmbeds& embeds                = job.embeds;
         const bool latent_upscale_enabled            = job.latent_upscale_enabled;
         const int64_t t0                             = job.t0;
+        MiniMaxH3::control_latent() = std::move(job.control);
         if (batch != nullptr) {
             // other jobs ran their preparation since this one: restore its per-generation state
             sd->reset_cancel_flag();

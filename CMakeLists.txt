@@ -317,6 +317,7 @@ if(SD_SYCL)
     endif()
     message("-- Turn off fast-math for host in SYCL backend")
     target_compile_options(${SD_LIB} PRIVATE ${SYCL_COMPILE_OPTIONS})
+    target_compile_definitions(${SD_LIB} PRIVATE SD_USE_SYCL)
 endif()
 
 set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)

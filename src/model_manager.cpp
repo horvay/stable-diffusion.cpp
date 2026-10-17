@@ -1,3 +1,6 @@
+#ifdef SD_USE_SYCL
+#include "ggml-sycl.h"
+#endif
 #include "model_manager.h"
 
 #include <algorithm>
@@ -1607,6 +1610,11 @@ void ModelManager::release_idle_device_memory() {
         entry.second();
     }
     release_compute_staging_blocks(false);
+#ifdef SD_USE_SYCL
+    // ggml-sycl's pools keep freed temporaries (text encoder, VAE) for reuse; hand them back before sampling, when the
+    // native XPU block library needs the memory (a 5-shot Gary batch OOM'd in xpu_h3 without this, 2026-10-17).
+    ggml_backend_sycl_release_pool_cache();
+#endif
 }
 
 void ModelManager::evict_compute_backend_params(const std::vector<ggml_tensor*>& tensors) {

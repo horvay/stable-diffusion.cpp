@@ -31,6 +31,12 @@
 #include "json.hpp"
 #include "zip.h"
 
+#ifdef __linux__
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
 #include "name_conversion.h"
 
 /*================================================= Preprocess ==================================================*/
@@ -1054,7 +1060,12 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
     std::atomic<int64_t> convert_time_ms(0);
     std::atomic<uint64_t> bytes_processed(0);
 
-    int num_threads_to_use = n_threads_;
+    // Loading is bound by the disk (and on this workstation by dm-crypt decryption), not by the number of readers:
+    // 16 readers at ~3 GB/s kept every core busy in the kernel and froze the desktop for a few seconds per load.
+    // SD_LOAD_THREADS overrides the cap of 4; the readers also run at nice 10.
+    const char* load_threads_env = getenv("SD_LOAD_THREADS");
+    const int load_threads_cap   = load_threads_env != nullptr ? std::max(1, atoi(load_threads_env)) : 4;
+    int num_threads_to_use       = std::min(n_threads_, load_threads_cap);
 
     int64_t start_time = ggml_time_ms();
 
@@ -1128,6 +1139,9 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
 
         for (int i = 0; i < n_threads; ++i) {
             workers.emplace_back([&, file_path, is_zip]() {
+#ifdef __linux__
+                setpriority(PRIO_PROCESS, (id_t) syscall(SYS_gettid), 10);
+#endif
                 std::ifstream file;
                 zip_t* zip = nullptr;
                 if (is_zip) {

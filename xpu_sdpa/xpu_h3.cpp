@@ -79,6 +79,39 @@ State& S() {
     return *s;
 }
 
+// ---- Fun ControlNet-Union (SD_XPU_H3_CONTROL="controlnet.safetensors[@strength]") ----
+//
+// Mirrors ComfyUI comfy/ldm/minimax/controlnet.py + MiniMaxH3FunControlPatch: a control stream c starts from the
+// hidden state entering block 0, with every video row replaced by control_proj_in(control rows) (zero rows for
+// reference / keyframe video rows), then c = before_proj(c) + h. After base block L_k (L = 0, 50/n, ...), control
+// block k runs on c and h += strength * after_proj(c), with audio rows left untouched. The control rows come from
+// sd.cpp per call (xpu_h3_set_control): the VAE latent of the control video, patchified like the target video.
+
+struct LinearBF16 {  // y = x W^T + b; W bf16 [out, in] resident, b f32 [out]
+    Buf w, b;
+    int64_t out = 0, in = 0;
+};
+
+struct Control {
+    std::unique_ptr<xn::SafeTensors> st;  // control blocks stream from here into pooled memory at each use
+    int64_t n_blocks = 0;
+    std::vector<LinearBF16> after;
+    LinearBF16 before;
+    Buf proj_w, proj_b;  // f32 [hidden, proj_in], [hidden]
+    int64_t proj_in = 0;
+    std::vector<int64_t> layers;
+    float strength = 1.f;
+    bool loaded    = false;
+    std::vector<float> rows;    // host [n_rows, cols] control rows for the current call (zeros except target video)
+    std::vector<int8_t> kinds;  // host [n_rows]: 0 other (text), 1 video (reference or target), 2 audio
+    int64_t n_rows = 0, cols = 0;
+};
+
+Control& C() {
+    static auto* c = new Control();
+    return *c;
+}
+
 const bool g_int8 = [] {
     const char* v = std::getenv("SD_XPU_H3_INT8");
     return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
@@ -203,7 +236,7 @@ Buf upload_bf16(const std::vector<float>& v) {
     return d;
 }
 
-Linear load_linear(xn::SafeTensors& st, const std::string& prefix) {
+Linear load_linear(xn::SafeTensors& st, const std::string& prefix, bool resident = true) {
     const std::string cfg = st.str(prefix + ".comfy_quant");
     if (cfg.find("int8_tensorwise") == std::string::npos) {
         throw std::runtime_error(prefix + ": expected int8_tensorwise convrot weights");
@@ -217,7 +250,7 @@ Linear load_linear(xn::SafeTensors& st, const std::string& prefix) {
         l.group = 0;
     }
     std::vector<int64_t> shape;
-    l.q = xn::load_tensor(st, prefix + ".weight", DType::s8, true, &shape);
+    l.q = xn::load_tensor(st, prefix + ".weight", DType::s8, resident, &shape);
     if (shape.size() != 2) {
         throw std::runtime_error(prefix + ".weight: expected a 2-D weight");
     }
@@ -225,11 +258,11 @@ Linear load_linear(xn::SafeTensors& st, const std::string& prefix) {
     l.in           = shape[1];
     const auto& si = st.info(prefix + ".weight_scale");
     if (si.numel() == l.out) {
-        l.s = xn::load_tensor(st, prefix + ".weight_scale", DType::f32);
+        l.s = xn::load_tensor(st, prefix + ".weight_scale", DType::f32, resident);
     } else if (si.numel() == 1) {  // one scale for the whole tensor: broadcast per row
         auto s1 = st.host_f32(prefix + ".weight_scale");
         std::vector<float> s(static_cast<size_t>(l.out), s1[0]);
-        l.s = xn::resident(s.size() * 4);
+        l.s = resident ? xn::resident(s.size() * 4) : xn::scratch(s.size() * 4);
         xn::h2d(l.s.get(), s.data(), s.size() * 4);
     } else {
         throw std::runtime_error(prefix + ".weight_scale: unexpected size");
@@ -361,6 +394,91 @@ void append_lora_rows_int8(Linear& l, const HostLora& h) {
     l.rank      = r;
 }
 
+void load_block(xn::SafeTensors& st, const std::string& p, Block& b, bool res = true) {
+    b.norm1  = xn::load_tensor(st, p + "norm1.weight", DType::f32, res);
+    b.norm2  = xn::load_tensor(st, p + "norm2.weight", DType::f32, res);
+    b.q_norm = xn::load_tensor(st, p + "attn.q_norm.weight", DType::f32, res);
+    b.k_norm = xn::load_tensor(st, p + "attn.k_norm.weight", DType::f32, res);
+    b.qkv    = load_linear(st, p + "attn.qkv_proj", res);
+    b.out    = load_linear(st, p + "attn.out_proj", res);
+    b.fc1    = load_linear(st, p + "mlp.fc1", res);
+    b.fc2    = load_linear(st, p + "mlp.fc2", res);
+    std::vector<int64_t> shape;
+    b.ada_w = xn::load_tensor(st, p + "adaln_proj.linear.weight", DType::f32, res, &shape);
+    b.ada_n = shape.at(0);
+    b.ada_k = shape.at(1);
+    b.ada_b = xn::load_tensor(st, p + "adaln_proj.linear.bias", DType::f32, res);
+}
+
+// convrot group size of an int8 linear from its comfy_quant tag (0: no rotation)
+int64_t linear_group(xn::SafeTensors& st, const std::string& prefix) {
+    const std::string cfg = st.str(prefix + ".comfy_quant");
+    if (cfg.find("\"convrot\": true") == std::string::npos && cfg.find("\"convrot\":true") == std::string::npos) {
+        return 0;
+    }
+    std::smatch m;
+    return std::regex_search(cfg, m, std::regex(R"("convrot_groupsize":\s*([0-9]+))")) ? std::stoll(m[1]) : 256;
+}
+
+LinearBF16 load_linear_bf16(xn::SafeTensors& st, const std::string& p) {
+    LinearBF16 l;
+    std::vector<int64_t> shape;
+    l.w   = xn::load_tensor(st, p + ".weight", DType::bf16, true, &shape);
+    l.out = shape.at(0);
+    l.in  = shape.at(1);
+    l.b   = xn::load_tensor(st, p + ".bias", DType::f32);
+    return l;
+}
+
+void load_control(const char* spec, int64_t n_base_blocks, int verbose) {
+    const auto t0    = std::chrono::steady_clock::now();
+    std::string path = spec;
+    auto& c          = C();
+    c.strength       = 1.f;
+    if (const auto at = path.rfind('@'); at != std::string::npos && at + 1 < path.size() &&
+                                         path.find('/', at) == std::string::npos) {
+        c.strength = std::stof(path.substr(at + 1));
+        path       = path.substr(0, at);
+    }
+    c.st   = std::make_unique<xn::SafeTensors>(path);
+    auto& st = *c.st;
+    int n    = 0;
+    while (st.has("control_blocks." + std::to_string(n) + ".after_proj.weight")) {
+        ++n;
+    }
+    if (n == 0 || !st.has("control_proj_in.weight")) {
+        throw std::runtime_error(path + ": not a MiniMax-H3 Fun ControlNet (no control_blocks / control_proj_in)");
+    }
+    c.n_blocks = n;
+    c.after.clear();
+    c.layers.clear();
+    for (int k = 0; k < n; ++k) {
+        const std::string p = "control_blocks." + std::to_string(k) + ".";
+        for (const char* lin : {"attn.qkv_proj", "attn.out_proj", "mlp.fc1", "mlp.fc2"}) {
+            if (!st.has(p + lin + ".comfy_quant")) {
+                throw std::runtime_error(path + ": " + p + lin + " is not int8 convrot");
+            }
+        }
+        c.after.push_back(load_linear_bf16(st, p + "after_proj"));
+        c.layers.push_back(k * (n_base_blocks / n));  // ComfyUI default: spread evenly (v1: every 10, v2: every 5)
+    }
+    c.before = load_linear_bf16(st, "control_blocks.0.before_proj");
+    std::vector<int64_t> shape;
+    c.proj_w  = xn::load_tensor(st, "control_proj_in.weight", DType::f32, true, &shape);
+    c.proj_in = shape.at(1);
+    c.proj_b  = xn::load_tensor(st, "control_proj_in.bias", DType::f32);
+    c.loaded  = true;
+    if (verbose) {
+        std::string places;
+        for (auto l : c.layers) {
+            places += (places.empty() ? "" : ",") + std::to_string(l);
+        }
+        std::fprintf(stderr, "[xpu_h3] control: %d blocks at layers %s, strength %.2f, in %lld, from %s in %.1f s\n", n, places.c_str(),
+                     c.strength, (long long)c.proj_in, path.c_str(),
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }
+}
+
 void load_weights(const char* path, int verbose) {
     const auto t0 = std::chrono::steady_clock::now();
     xn::SafeTensors st(path);
@@ -375,21 +493,7 @@ void load_weights(const char* path, int verbose) {
     blocks.clear();
     blocks.resize(n_blocks);
     for (int i = 0; i < n_blocks; ++i) {
-        const std::string p = "blocks." + std::to_string(i) + ".";
-        Block& b            = blocks[i];
-        b.norm1             = xn::load_tensor(st, p + "norm1.weight", DType::f32);
-        b.norm2             = xn::load_tensor(st, p + "norm2.weight", DType::f32);
-        b.q_norm            = xn::load_tensor(st, p + "attn.q_norm.weight", DType::f32);
-        b.k_norm            = xn::load_tensor(st, p + "attn.k_norm.weight", DType::f32);
-        b.qkv               = load_linear(st, p + "attn.qkv_proj");
-        b.out               = load_linear(st, p + "attn.out_proj");
-        b.fc1               = load_linear(st, p + "mlp.fc1");
-        b.fc2               = load_linear(st, p + "mlp.fc2");
-        std::vector<int64_t> shape;
-        b.ada_w = xn::load_tensor(st, p + "adaln_proj.linear.weight", DType::f32, true, &shape);
-        b.ada_n = shape.at(0);
-        b.ada_k = shape.at(1);
-        b.ada_b = xn::load_tensor(st, p + "adaln_proj.linear.bias", DType::f32);
+        load_block(st, "blocks." + std::to_string(i) + ".", blocks[i]);
     }
     std::vector<std::array<HostLora, 4>> loras(static_cast<size_t>(n_blocks));
     load_loras(loras, verbose);
@@ -403,10 +507,18 @@ void load_weights(const char* path, int verbose) {
             }
         }
     }
+    if (const char* cs = std::getenv("SD_XPU_H3_CONTROL"); cs != nullptr && *cs != '\0') {
+        load_control(cs, n_blocks, verbose);
+    }
     bool fused = g_int8 && std::getenv("SD_XPU_H3_INT8_UNFUSED") == nullptr;
     for (const auto& b : blocks) {
         for (const Linear* l : {&b.qkv, &b.out, &b.fc1, &b.fc2}) {
             fused = fused && l->group == 256;
+        }
+    }
+    for (int64_t k = 0; k < C().n_blocks && C().st; ++k) {
+        for (const char* lin : {"attn.qkv_proj", "attn.out_proj", "mlp.fc1", "mlp.fc2"}) {
+            fused = fused && linear_group(*C().st, "control_blocks." + std::to_string(k) + "." + lin) == 256;
         }
     }
     S().fused = fused;
@@ -434,6 +546,13 @@ void ensure_loaded(int verbose) {
     } catch (...) {
         S().blocks.clear();
         S().loaded = false;
+        C().st.reset();
+        C().n_blocks = 0;
+        C().after.clear();
+        C().before = LinearBF16{};
+        C().proj_w.reset();
+        C().proj_b.reset();
+        C().loaded = false;
         xn::release_all();
         throw;
     }
@@ -627,6 +746,98 @@ void qk_norm_rope(const bf16* qkv, const float* wq, const float* wk, const bf16*
     });
 }
 
+// ---- ControlNet stream ----
+
+// y f32 [n, l.out] = x bf16 [n, l.in] W^T + b; accumulate=true adds onto y's current contents
+void linear_bf16(const bf16* x, int64_t n, const LinearBF16& l, float* y, bool accumulate) {
+    xn::MatmulArgs a;
+    a.M = n, a.K = l.in, a.N = l.out;
+    a.xt = DType::bf16, a.x = x, a.wt = DType::bf16, a.w = l.w.get();
+    a.yt = DType::f32, a.y = y, a.bt = DType::f32, a.bias = l.b.get();
+    a.accumulate = accumulate;
+    xn::matmul(a);
+}
+
+// c = before_proj(c0) + h, where c0 = h with every video row (kinds == 1) replaced by control_proj_in(control row)
+Buf control_init(const float* h, int64_t rows, int64_t hidden, const int8_t* kinds, int64_t chunk) {
+    const Control& ctl = C();
+    const int64_t cols = ctl.cols;
+    Buf c              = xn::scratch_n<float>(rows * hidden);
+    Q().memcpy(c.get(), h, static_cast<size_t>(rows * hidden) * 4).wait();
+    float* cp = c.as<float>();
+    for (int64_t s = 0; s < rows; s += chunk) {
+        const int64_t n = std::min(rows, s + chunk) - s;
+        Buf r           = xn::scratch_n<float>(n * cols);
+        xn::h2d(r.get(), ctl.rows.data() + s * cols, static_cast<size_t>(n * cols) * 4);
+        Buf p = xn::scratch_n<float>(n * hidden);
+        xn::MatmulArgs a;
+        a.M = n, a.K = cols, a.N = hidden;
+        a.xt = DType::f32, a.x = r.get(), a.wt = DType::f32, a.w = ctl.proj_w.get();
+        a.yt = DType::f32, a.y = p.get(), a.bt = DType::f32, a.bias = ctl.proj_b.get();
+        xn::matmul(a);
+        const float* pp = p.as<float>();
+        Q().parallel_for(sycl::range<1>(static_cast<size_t>(n * hidden)), [=](sycl::id<1> id) {
+            const int64_t i = id[0], row = s + i / hidden;
+            if (kinds[row] == 1) {
+                cp[row * hidden + i % hidden] = pp[i];
+            }
+        });
+    }
+    for (int64_t s = 0; s < rows; s += chunk) {
+        const int64_t n = std::min(rows, s + chunk) - s;
+        Buf cb          = xn::scratch_n<bf16>(n * hidden);
+        xn::convert(cp + s * hidden, cb.as<bf16>(), n * hidden);
+        Q().memcpy(cp + s * hidden, h + s * hidden, static_cast<size_t>(n * hidden) * 4);
+        linear_bf16(cb.as<bf16>(), n, ctl.before, cp + s * hidden, true);
+    }
+    return c;
+}
+
+const bool g_ctl_debug = std::getenv("SD_XPU_H3_CONTROL_DEBUG") != nullptr;
+double g_dbg[3][3]     = {};
+
+// h += strength * after_proj(c) on every row except audio rows (kinds == 2)
+void control_add(float* h, const float* c, int64_t rows, int64_t hidden, const int8_t* kinds, const LinearBF16& after, float strength, int64_t chunk) {
+    for (int64_t s = 0; s < rows; s += chunk) {
+        const int64_t n = std::min(rows, s + chunk) - s;
+        Buf cb          = xn::scratch_n<bf16>(n * hidden);
+        xn::convert(c + s * hidden, cb.as<bf16>(), n * hidden);
+        Buf y = xn::scratch_n<float>(n * hidden);
+        linear_bf16(cb.as<bf16>(), n, after, y.as<float>(), false);
+        const float* yp = y.as<float>();
+        if (g_ctl_debug) {  // rms of the skip and of h over this chunk's video rows (SD_XPU_H3_CONTROL_DEBUG=1)
+            std::vector<float> ys(static_cast<size_t>(n * hidden)), hs(ys.size());
+            std::vector<int8_t> ks(static_cast<size_t>(n));
+            Q().memcpy(ys.data(), yp, ys.size() * 4);
+            Q().memcpy(hs.data(), h + s * hidden, hs.size() * 4);
+            Q().memcpy(ks.data(), kinds + s, ks.size()).wait();
+            for (int64_t r = 0; r < n; ++r) {
+                const int k = ks[r];
+                for (int64_t col = 0; col < hidden; ++col) {
+                    g_dbg[k][0] += static_cast<double>(ys[r * hidden + col]) * ys[r * hidden + col];
+                    g_dbg[k][1] += static_cast<double>(hs[r * hidden + col]) * hs[r * hidden + col];
+                }
+                g_dbg[k][2] += 1;
+            }
+        }
+        Q().parallel_for(sycl::range<1>(static_cast<size_t>(n * hidden)), [=](sycl::id<1> id) {
+            const int64_t i = id[0], row = s + i / hidden;
+            if (kinds[row] != 2) {
+                h[row * hidden + i % hidden] += strength * yp[i];
+            }
+        });
+    }
+    if (g_ctl_debug) {
+        for (int k = 0; k < 3; ++k) {
+            if (g_dbg[k][2] > 0) {
+                std::fprintf(stderr, "[xpu_h3] control skip kind %d: %.0f rows, rms(skip) %.4g, rms(h) %.4g\n", k, g_dbg[k][2],
+                             std::sqrt(g_dbg[k][0] / (g_dbg[k][2] * hidden)), std::sqrt(g_dbg[k][1] / (g_dbg[k][2] * hidden)));
+            }
+            g_dbg[k][0] = g_dbg[k][1] = g_dbg[k][2] = 0;
+        }
+    }
+}
+
 const int64_t g_max_blocks = xn::env_i64("SD_XPU_MAX_BLOCKS", -1);
 
 // The whole step. All device buffers are pooled and released (trimmed) at the end.
@@ -701,21 +912,19 @@ void run_blocks(const float* x_host, int64_t rows, int64_t hidden, const float* 
             Q().memcpy(mod_row.get(), rows_mod.data(), rows_mod.size() * 4).wait();
         }
         auto& queue            = Q();
-        auto norm_linear_fused = [&](const Buf& w, const Buf& mods, int64_t s, int64_t e, int shift_i, int scale_i, const Linear& l) {
+        auto norm_linear_fused = [&](float* xp, const Buf& w, const Buf& mods, int64_t s, int64_t e, int shift_i, int scale_i, const Linear& l) {
             Buf xq = xn::scratch(static_cast<size_t>((e - s) * hidden));
             Buf sx = xn::scratch_n<float>(e - s);
-            xh3::rms_mod_rot_quant(queue, x.as<float>() + s * hidden, w.as<float>(), mods.as<float>(), mod_row.as<int32_t>() + s, shift_i, scale_i,
+            xh3::rms_mod_rot_quant(queue, xp + s * hidden, w.as<float>(), mods.as<float>(), mod_row.as<int32_t>() + s, shift_i, scale_i,
                                    e - s, hidden, eps, xq.as<int8_t>(), sx.as<float>());
             return matmul_int8_lora(xq, sx, e - s, l);
         };
 
         const double attn_flops = 4.0 * static_cast<double>(rows) * static_cast<double>(rows) * static_cast<double>(inner);
         const size_t n_run      = g_max_blocks >= 0 ? std::min<size_t>(blocks.size(), static_cast<size_t>(g_max_blocks)) : blocks.size();
-        for (size_t bi = 0; bi < n_run; ++bi) {
-            const Block& blk       = blocks[bi];
-            const StepTimes before = g_times;
-            const auto block_start = clock::now();
-            Buf mods               = xn::scratch_n<float>(trows * blk.ada_n);  // [trows * 3, 6, hidden]
+        // one transformer block on the residual stream xp [rows, hidden] f32 (the base stream or the control stream)
+        auto run_block = [&](const Block& blk, float* xp) {
+            Buf mods = xn::scratch_n<float>(trows * blk.ada_n);  // [trows * 3, 6, hidden]
             {
                 xn::MatmulArgs a;
                 a.M = trows, a.K = tdim, a.N = blk.ada_n;
@@ -729,10 +938,10 @@ void run_blocks(const float* x_host, int64_t rows, int64_t hidden, const float* 
                 const int64_t e = std::min(rows, s + chunk);
                 Buf qkv;
                 if (fused) {
-                    qkv = norm_linear_fused(blk.norm1, mods, s, e, 0, 1, blk.qkv);
+                    qkv = norm_linear_fused(xp, blk.norm1, mods, s, e, 0, 1, blk.qkv);
                 } else {
                     Buf h = xn::scratch_n<bf16>((e - s) * hidden);
-                    norm_mod(x.as<float>(), blk.norm1.as<float>(), mods.as<float>(), sd, n_segs, 0, 1, s, e - s, hidden, eps, h.as<bf16>());
+                    norm_mod(xp, blk.norm1.as<float>(), mods.as<float>(), sd, n_segs, 0, 1, s, e - s, hidden, eps, h.as<bf16>());
                     qkv = linear(h.as<bf16>(), e - s, blk.qkv);
                 }
                 qk_norm_rope(qkv.as<bf16>(), blk.q_norm.as<float>(), blk.k_norm.as<float>(), cosv.as<bf16>(), sinv.as<bf16>(), half_rot, s, e - s,
@@ -758,7 +967,7 @@ void run_blocks(const float* x_host, int64_t rows, int64_t hidden, const float* 
                     xn::heads_to_tokens(o.as<bf16>(), heads, rows, head_dim, s, e - s, a.as<bf16>());
                     y = linear(a.as<bf16>(), e - s, blk.out);
                 }
-                gated_add(x.as<float>(), y.as<bf16>(), mods.as<float>(), sd, n_segs, 2, s, e - s, hidden);
+                gated_add(xp, y.as<bf16>(), mods.as<float>(), sd, n_segs, 2, s, e - s, hidden);
             }
             o.reset();
 
@@ -767,7 +976,7 @@ void run_blocks(const float* x_host, int64_t rows, int64_t hidden, const float* 
                 Buf y;
                 if (fused) {
                     g_cat           = T_FC1;
-                    Buf uv          = norm_linear_fused(blk.norm2, mods, s, e, 3, 4, blk.fc1);
+                    Buf uv          = norm_linear_fused(xp, blk.norm2, mods, s, e, 3, 4, blk.fc1);
                     const int64_t f = blk.fc1.out / 2;
                     Buf xq          = xn::scratch(static_cast<size_t>((e - s) * f));
                     Buf sx          = xn::scratch_n<float>(e - s);
@@ -778,7 +987,7 @@ void run_blocks(const float* x_host, int64_t rows, int64_t hidden, const float* 
                 } else {
                     g_cat = T_FC1;
                     Buf h = xn::scratch_n<bf16>((e - s) * hidden);
-                    norm_mod(x.as<float>(), blk.norm2.as<float>(), mods.as<float>(), sd, n_segs, 3, 4, s, e - s, hidden, eps, h.as<bf16>());
+                    norm_mod(xp, blk.norm2.as<float>(), mods.as<float>(), sd, n_segs, 3, 4, s, e - s, hidden, eps, h.as<bf16>());
                     Buf uv = linear(h.as<bf16>(), e - s, blk.fc1);
                     h.reset();
                     const int64_t f = blk.fc1.out / 2;
@@ -788,7 +997,37 @@ void run_blocks(const float* x_host, int64_t rows, int64_t hidden, const float* 
                     g_cat = T_FC2;
                     y     = linear(act.as<bf16>(), e - s, blk.fc2);
                 }
-                gated_add(x.as<float>(), y.as<bf16>(), mods.as<float>(), sd, n_segs, 5, s, e - s, hidden);
+                gated_add(xp, y.as<bf16>(), mods.as<float>(), sd, n_segs, 5, s, e - s, hidden);
+            }
+        };
+
+        // ControlNet: the control stream starts from the hidden state entering block 0 (see Control above)
+        Control& ctl       = C();
+        const bool use_ctl = ctl.loaded && ctl.strength != 0.f && ctl.n_rows == rows && ctl.cols == ctl.proj_in;
+        if (ctl.loaded && !use_ctl && verbose) {
+            std::fprintf(stderr, "[xpu_h3] control loaded but inactive (rows %lld vs %lld, cols %lld vs %lld, strength %.2f)\n", (long long)ctl.n_rows,
+                         (long long)rows, (long long)ctl.cols, (long long)ctl.proj_in, ctl.strength);
+        }
+        Buf cst, kinds_dev;
+        if (use_ctl) {
+            kinds_dev = xn::scratch(static_cast<size_t>(rows));
+            Q().memcpy(kinds_dev.get(), ctl.kinds.data(), static_cast<size_t>(rows)).wait();
+            cst = control_init(x.as<float>(), rows, hidden, kinds_dev.as<int8_t>(), chunk);
+        }
+
+        for (size_t bi = 0; bi < n_run; ++bi) {
+            const StepTimes before = g_times;
+            const auto block_start = clock::now();
+            run_block(blocks[bi], x.as<float>());
+            if (use_ctl) {
+                for (size_t k = 0; k < ctl.layers.size(); ++k) {
+                    if (ctl.layers[k] == static_cast<int64_t>(bi)) {
+                        Block cb;  // streamed from the checkpoint into pooled memory, freed after use
+                        load_block(*ctl.st, "control_blocks." + std::to_string(k) + ".", cb, false);
+                        run_block(cb, cst.as<float>());
+                        control_add(x.as<float>(), cst.as<float>(), rows, hidden, kinds_dev.as<int8_t>(), ctl.after[k], ctl.strength, chunk);
+                    }
+                }
             }
             if (g_timing >= 2) {
                 queue.wait();
@@ -886,6 +1125,13 @@ XN_EXPORT void xpu_h3_release() {
         }
         S().blocks.clear();
         S().loaded = false;
+        C().st.reset();
+        C().n_blocks = 0;
+        C().after.clear();
+        C().before = LinearBF16{};
+        C().proj_w.reset();
+        C().proj_b.reset();
+        C().loaded = false;
         g_sdpa_checked.clear();
         xn::release_all();
         if (xn::g_rt_started && xn::pool().verbose()) {
@@ -894,6 +1140,24 @@ XN_EXPORT void xpu_h3_release() {
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[xpu_h3] release error: %s\n", e.what());
     }
+}
+
+// Control rows for the following xpu_h3_blocks() calls (SD_XPU_H3_CONTROL weights): rows [n_rows, cols] f32 aligned
+// with the packed hidden state (the patchified control latent on the target video rows, zeros elsewhere) and
+// kinds [n_rows] (0 other, 1 video, 2 audio). rows == nullptr clears them.
+XN_EXPORT int xpu_h3_set_control(const float* rows, int64_t n_rows, int64_t cols, const int8_t* kinds) {
+    auto& c = C();
+    if (rows == nullptr || kinds == nullptr || n_rows <= 0 || cols <= 0) {
+        c.rows.clear();
+        c.kinds.clear();
+        c.n_rows = c.cols = 0;
+        return 0;
+    }
+    c.rows.assign(rows, rows + n_rows * cols);
+    c.kinds.assign(kinds, kinds + n_rows);
+    c.n_rows = n_rows;
+    c.cols   = cols;
+    return 0;
 }
 
 XN_EXPORT int xpu_h3_blocks(const float* x_host,

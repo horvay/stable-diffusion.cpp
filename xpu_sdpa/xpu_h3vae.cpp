@@ -636,12 +636,7 @@ XN_EXPORT int xpu_h3vae_decode(const float* z_host,
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[xpu_h3vae] decode error: %s\n", e.what());
-        try {
-            if (xn::g_rt_started) {
-                xn::pool().trim();
-            }
-        } catch (...) {
-        }
+        xn::trim_after_error(e);
         return 1;
     }
 }

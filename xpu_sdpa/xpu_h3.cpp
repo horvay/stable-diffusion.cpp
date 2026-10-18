@@ -915,12 +915,7 @@ XN_EXPORT int xpu_h3_blocks(const float* x_host,
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[xpu_h3] error: %s\n", e.what());
-        try {
-            if (xn::g_rt_started) {
-                xn::pool().trim();
-            }
-        } catch (...) {
-        }
+        xn::trim_after_error(e);
         return 1;
     }
 }

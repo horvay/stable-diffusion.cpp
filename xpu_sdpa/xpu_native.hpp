@@ -17,8 +17,10 @@
 //   io         safetensors reader, chunked host<->device copies through two bounded pinned staging buffers.
 //
 // Environment (all libraries):
-//   SD_XPU_POOL_CACHE_MB  (default 4096)  max bytes of freed blocks the pool keeps cached for reuse; above it,
-//                                         blocks go straight back to the driver.
+//   SD_XPU_POOL_CACHE_MB  (default 1024)  max bytes of freed blocks the pool keeps cached for reuse; above it,
+//                                         blocks go straight back to the driver. (4096 left an HD ControlNet H3 job
+//                                         at 31+ of 32 GiB; past the card the driver moves buffers to system memory
+//                                         and the job crawls. 1024 costs no measurable speed, 2026-10-18.)
 //   SD_XPU_POOL_LIMIT_MB  (default 0=off) hard cap on live + cached pool bytes; an allocation over it first
 //                                         trims the cache, then fails with a clear error instead of a driver OOM.
 //   SD_XPU_POOL_VERBOSE=1                 print pool statistics on trim.
@@ -179,7 +181,7 @@ class Pool {
 public:
     explicit Pool(sycl::queue& q)
         : q_(q) {
-        cache_cap_ = static_cast<size_t>(env_i64("SD_XPU_POOL_CACHE_MB", 4096)) << 20;
+        cache_cap_ = static_cast<size_t>(env_i64("SD_XPU_POOL_CACHE_MB", 1024)) << 20;
         limit_     = static_cast<size_t>(env_i64("SD_XPU_POOL_LIMIT_MB", 0)) << 20;
         verbose_   = env_i64("SD_XPU_POOL_VERBOSE", 0) != 0;
     }

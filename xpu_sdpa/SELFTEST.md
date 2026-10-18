@@ -57,7 +57,7 @@ All the existing variables keep their meaning (`SD_XPU_H3_WEIGHTS`, `SD_XPU_H3_I
 | `SD_XPU_H3_SDPA` | `graph` (the default) uses oneDNN Graph fused SDPA. `sycl` forces the SYCL flash-attention kernel. The old `torch` value now means graph. |
 | `SD_XPU_H3_SDPA_CHECK` / `_TOL` | The first graph SDPA call at each sequence length is checked against the SYCL kernel on 256 query rows. |
 | `SD_XPU_H3VAE_SDPA`, `SD_XPU_QWEN21_SDPA` | `sycl` forces the SYCL kernel. |
-| `SD_XPU_POOL_CACHE_MB` | Default 4096. The most freed device memory the pool keeps for reuse. |
+| `SD_XPU_POOL_CACHE_MB` | Default 1024. The most freed device memory the pool keeps for reuse. |
 | `SD_XPU_POOL_LIMIT_MB` | Default 0, meaning off. A hard cap on live plus cached pool memory. Going over it fails with a clear error instead of a driver out-of-memory. |
 | `SD_XPU_POOL_VERBOSE=1` | Prints pool statistics after each call and on release. |
 | `SD_XPU_MAX_BLOCKS=N` | Debug and self-test only. Runs the first N blocks. |

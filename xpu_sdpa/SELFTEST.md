@@ -27,7 +27,7 @@ Each library has a self-test mode. When `SD_XPU_H3_SELFTEST=<dir>`, `SD_XPU_H3VA
 
 ```sh
 cd ~/ai/stable-diffusion.cpp-b70-native/xpu_sdpa
-SD_XPU_H3_WEIGHTS=~/ai/weeb/models/DasiwaMinimaxH3_dasiwaHybrid4turboV1.safetensors ./selftest.sh h3
+SD_XPU_H3_WEIGHTS=~/ai/models/minimax-h3/DasiwaMinimaxH3_dasiwaHybridV4Turbo_3281858.safetensors ./selftest.sh h3
 SD_XPU_H3_INT8=1 SD_XPU_H3_WEIGHTS=... ./selftest.sh h3                 # int8 W8A8 fused path
 SD_XPU_H3VAE_WEIGHTS=<H3 video VAE .safetensors> ./selftest.sh h3vae
 SD_XPU_QWEN21_WEIGHTS=~/ai/weeb/models/QWEN21/noctQAnime_v10_int8_convrot.safetensors ./selftest.sh qwen21

@@ -27,7 +27,7 @@ the Vulkan FA kernels; build it ANV-only into a prefix and point
 
 ```sh
 export SD_XPU_H3_LIB=$PWD/xpu_sdpa/libxpu_h3.so
-export SD_XPU_H3_WEIGHTS=/models/DasiwaMinimaxH3_dasiwaHybrid4turboV1.safetensors  # ComfyUI int8 convrot checkpoint
+export SD_XPU_H3_WEIGHTS=/models/DasiwaMinimaxH3_dasiwaHybridV4Turbo_3281858.safetensors  # ComfyUI int8 convrot checkpoint
 sd-cli -M vid_gen --diffusion-model <same model, any format> --vae ... --audio-vae ... --llm ... \
   --backend diffusion=vulkan0,te=vulkan0,vae=vulkan0 --offload-to-cpu --fa --max-vram 0 \
   -r ref1.png -r ref2.png --ref-video motion_frames/ --guide opening.png@0 --guide end.png@93 \

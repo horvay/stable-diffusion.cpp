@@ -341,7 +341,7 @@ inline Pool& pool() { return *rt().pool; }
 
 // Error path of an exported entry point: hand the cached blocks back so a fallback has room. Not after a SYCL or
 // oneDNN runtime error: the queue may hold a command that never completes, and trim's queue wait then spins forever
-// (Gary k20 a14, 2026-10-17: UR_RESULT_ERROR_OUT_OF_RESOURCES, then 13 min at 100% CPU in Pool::trim).
+// (an H3 shot, 2026-10-17: UR_RESULT_ERROR_OUT_OF_RESOURCES, then 13 min at 100% CPU in Pool::trim).
 inline void trim_after_error(const std::exception& e) {
     if (!g_rt_started || dynamic_cast<const sycl::exception*>(&e) != nullptr || dynamic_cast<const dnnl::error*>(&e) != nullptr) {
         return;

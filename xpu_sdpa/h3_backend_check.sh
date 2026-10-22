@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One tiny MiniMax-H3 Ref2VA job (448x256, 25 frames, 2 steps, Gary shot v01-k03's refs and guides) with every runner
+# One tiny MiniMax-H3 Ref2VA job (448x256, 25 frames, 2 steps, the refs and guides of the shot in SHOT) with every runner
 # output dumped (SD_DUMP_DIR), for comparing sd-cli on Vulkan against sd-cli on SYCL with compare_dumps.py.
 # The transformer blocks and the video VAE decoder run on the native XPU libraries in both cases, as in production.
 #   ./h3_backend_check.sh vulkan OUTDIR      (sd-cli from build-vulkan, Mesa ANV with the B70 patches)
@@ -8,7 +8,7 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 MODE=${1:?vulkan|sycl}; OUT=${2:?outdir}
-SHOT=${SHOT:-$HOME/ai/clips/short-stories/gary-ai-takeover/04-video-generation/shots/v01-k03}
+SHOT=${SHOT:?SHOT=<an H3 shot folder with prompt.txt and inputs/> is needed}
 mkdir -p "$OUT/dump"; rm -f "$OUT"/dump/*.f32
 NATIVE=$HOME/ai/stable-diffusion.cpp-b70-native/xpu_sdpa
 export SD_XPU_H3_LIB=$NATIVE/libxpu_h3.so SD_XPU_H3VAE_LIB=$NATIVE/libxpu_h3vae.so SD_XPU_H3_INT8=1

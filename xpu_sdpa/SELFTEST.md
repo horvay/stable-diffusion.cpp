@@ -12,7 +12,7 @@ ldd xpu_sdpa/libxpu_h3.so | grep -Ei 'torch|c10'   # must print nothing
 The reference libraries for the self-test are built from the original libtorch sources in `torchref/`. They are identical to production except that they honour `SD_XPU_MAX_BLOCKS`:
 
 ```sh
-TORCH_VENV=~/ai/weeb/.venv-xpu xpu_sdpa/torchref/build_torchref.sh
+TORCH_VENV=<venv with torch+xpu> xpu_sdpa/torchref/build_torchref.sh
 ```
 
 ## Self-test (runs on the GPU; only start it when the B70 is idle)
@@ -30,7 +30,7 @@ cd ~/ai/stable-diffusion.cpp-b70-native/xpu_sdpa
 SD_XPU_H3_WEIGHTS=~/ai/models/minimax-h3/DasiwaMinimaxH3_dasiwaHybridV4Turbo_3281858.safetensors ./selftest.sh h3
 SD_XPU_H3_INT8=1 SD_XPU_H3_WEIGHTS=... ./selftest.sh h3                 # int8 W8A8 fused path
 SD_XPU_H3VAE_WEIGHTS=<H3 video VAE .safetensors> ./selftest.sh h3vae
-SD_XPU_QWEN21_WEIGHTS=~/ai/weeb/models/QWEN21/noctQAnime_v10_int8_convrot.safetensors ./selftest.sh qwen21
+SD_XPU_QWEN21_WEIGHTS=~/models/image/qwen-image-2.1/noctQAnime_v10_int8_convrot.safetensors ./selftest.sh qwen21
 SD_XPU_MAX_BLOCKS=-1 SD_XPU_H3_WEIGHTS=... ./selftest.sh h3              # whole stack instead of one block
 ```
 

@@ -4,7 +4,7 @@
 # never used for rendering. Same toolchain as the production build (../build.sh, ../build_icpx.sh):
 #   libxpu_h3_torchref.so, libxpu_qwen21_torchref.so   icpx + torch + oneDNN (ONEDNN=~/opt/onednn-sycl)
 #   libxpu_h3vae_torchref.so                           g++ + torch
-# Usage: TORCH_VENV=~/ai/weeb/.venv-xpu ./build_torchref.sh [h3|h3vae|qwen21 ...]   (default: all three)
+# Usage: TORCH_VENV=<venv with torch+xpu> ./build_torchref.sh [h3|h3vae|qwen21 ...]   (default: all three)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
